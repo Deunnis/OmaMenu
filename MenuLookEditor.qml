@@ -10,9 +10,14 @@ Item {
   id: root
 
   // The Menu.qml root. Read for colors/fonts, written for the live values.
-  property Item menu: null
+  property var menu: null
 
+  // Emitted by the back affordance; Menu.qml wires this to goBack().
   signal done()
+
+  // Menu.qml sizes the card to this so nothing clips regardless of the
+  // theme's font/spacing scale.
+  implicitHeight: content.implicitHeight
 
   readonly property color fg: root.menu ? root.menu.foreground : Color.foreground
   readonly property string fam: root.menu ? root.menu.fontFamily : Style.font.family
@@ -73,21 +78,40 @@ Item {
   }
 
   Column {
-    anchors.fill: parent
+    id: content
+    anchors { top: parent.top; left: parent.left; right: parent.right }
     spacing: Style.space(16)
 
-    Text {
-      text: "Menu Look"
-      color: root.fg
-      font.family: root.fam
-      font.pixelSize: Style.font.heading
+    Row {
+      width: parent.width
+      spacing: Style.space(8)
+
+      Text {
+        id: backGlyph
+        text: "‹"
+        color: root.fg
+        opacity: backHover.hovered ? 1 : 0.55
+        font.family: root.fam
+        font.pixelSize: Style.font.heading
+        anchors.verticalCenter: title.verticalCenter
+        HoverHandler { id: backHover }
+        TapHandler { onTapped: root.done() }
+      }
+
+      Text {
+        id: title
+        text: "Menu Look"
+        color: root.fg
+        font.family: root.fam
+        font.pixelSize: Style.font.heading
+      }
     }
 
     Text {
       width: parent.width
       wrapMode: Text.WordWrap
       text: "Applies to this menu only, live as you drag, saved per theme — "
-        + "switching themes switches these too. Esc or ← goes back."
+        + "switching themes switches these too. Esc or ← also goes back."
       color: root.fg
       opacity: 0.55
       font.family: root.fam

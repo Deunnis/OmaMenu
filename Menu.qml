@@ -125,22 +125,72 @@ Item {
     lookConfigFile.setText(JSON.stringify(next, null, 2) + "\n")
   }
 
+  // style.json lives under ~/.local/state where another local process could
+  // plant a symlink or an oversized file at this exact path before this
+  // plugin ever creates it (the same TOCTOU shape OmaShuffle's state.json
+  // defends against). Read it through a descriptor-pinned, size-capped
+  // reader rather than a plain FileView.text() - opened once with
+  // O_NOFOLLOW|O_NONBLOCK, fstat-checked on that same descriptor to require
+  // a regular file, and read up to a fixed byte cap. Writes still go through
+  // FileView's atomicWrites, same as OmaShuffle.
+  readonly property int maxLookConfigBytes: 65536
+  readonly property string lookConfigReaderScript: [
+    "import os,sys,stat",
+    "path=sys.argv[1]; limit=int(sys.argv[2])",
+    "try:",
+    "    fd=os.open(path, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)",
+    "except OSError:",
+    "    sys.exit(2)",
+    "try:",
+    "    if not stat.S_ISREG(os.fstat(fd).st_mode):",
+    "        sys.exit(3)",
+    "    chunks=[]; total=0",
+    "    while total <= limit:",
+    "        chunk=os.read(fd, (limit + 1) - total)",
+    "        if not chunk: break",
+    "        chunks.append(chunk); total += len(chunk)",
+    "    if total > limit:",
+    "        sys.exit(4)",
+    "    sys.stdout.buffer.write(b''.join(chunks))",
+    "finally:",
+    "    os.close(fd)"
+  ].join("\n")
+
+  function readLookConfig() {
+    lookConfigReadProc.command = ["python3", "-c", root.lookConfigReaderScript,
+                                   root.lookConfigPath, String(root.maxLookConfigBytes)]
+    lookConfigReadProc.running = true
+  }
+
+  Process {
+    id: lookConfigReadProc
+    stdout: StdioCollector { id: lookConfigReadOut; waitForEnd: true }
+    onExited: function (code) {
+      if (code === 3) console.warn("Menu Look: style.json is not a regular file - ignoring it")
+      if (code === 4) console.warn("Menu Look: style.json exceeds " + root.maxLookConfigBytes + " bytes - ignoring it")
+      root.applyLookConfig(code === 0 ? lookConfigReadOut.text : "")
+    }
+  }
+
   Process {
     id: lookConfigDirProc
     command: ["mkdir", "-p", root.lookConfigDir]
     running: true
-    onExited: lookConfigFile.reload()
+    onExited: root.readLookConfig()
   }
 
+  // Write-only as far as this FileView is concerned - all reads go through
+  // readLookConfig() above. Deliberately NOT watchChanges: true - pairing
+  // that with preload: false on a path that doesn't exist yet made
+  // setText() silently no-op in testing (Quickshell 0.3.1). Harmless to
+  // drop: this menu is a single keepLoaded instance for the whole session,
+  // so nothing else is ever writing this file out from under it.
   FileView {
     id: lookConfigFile
     path: root.lookConfigPath
-    watchChanges: true
+    preload: false
     printErrors: false
     atomicWrites: true
-    onLoaded: root.applyLookConfig(text())
-    onLoadFailed: root.applyLookConfig("")
-    onFileChanged: reload()
   }
 
   // Watched so switching themes - this plugin's own picker, `omarchy theme
@@ -152,8 +202,11 @@ Item {
     watchChanges: true
     printErrors: false
     onLoaded: {
-      var slug = String(text() || "").trim()
-      root.currentThemeSlug = slug.length > 0 ? slug : "default"
+      // Same slug shape OmaShuffle validates theme names against before
+      // trusting one - this value becomes a JSON object key and gets
+      // written back into our own state file.
+      var slug = String(text() || "").trim().slice(0, 128)
+      root.currentThemeSlug = /^[a-z0-9][a-z0-9._-]*$/.test(slug) ? slug : "default"
     }
     onLoadFailed: root.currentThemeSlug = "default"
     onFileChanged: reload()
@@ -229,7 +282,7 @@ Item {
   property int cardHeight: root.dmenuActive
     ? Math.min(contentMargin * 2 + headerHeight + (mode === "input" ? 0 : contentSpacing + visibleRowsHeight), panel.height - Style.gapsOut * 2)
     : root.activeMenu === "style.menu-look"
-      ? Math.min(contentMargin * 2 + headerHeight + contentSpacing + Style.space(300), panel.height - Style.gapsOut * 2)
+      ? Math.min(contentMargin * 2 + Math.max(Style.space(220), lookEditor.implicitHeight), panel.height - Style.gapsOut * 2)
       : Math.min(contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight, panel.height - Style.gapsOut * 2)
 
   function finishRequest(selection) {
@@ -1285,6 +1338,7 @@ Item {
       }
 
       MenuLookEditor {
+        id: lookEditor
         anchors.fill: parent
         anchors.topMargin: card.contentTopInset
         anchors.rightMargin: card.contentRightInset

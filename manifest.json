@@ -2,9 +2,10 @@
   "schemaVersion": 1,
   "id": "deunnis.menu",
   "name": "Omarchy menu + Menu Look",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "author": "Deunnis",
-  "description": "The stock Omarchy command menu, plus a live \"Menu Look\" row under Style for scaling this menu's size, corners, border and transparency independently of the rest of the shell.",
+  "license": "MIT",
+  "description": "The stock Omarchy command menu, plus a live \"Menu Look\" row under Style: scale this menu, round its corners, set its border width and transparency - saved per theme, without touching the rest of the shell.",
   "kinds": [
     "menu",
     "bar-widget"
