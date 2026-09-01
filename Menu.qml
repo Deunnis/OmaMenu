@@ -148,6 +148,13 @@ Item {
   readonly property int maxMenuFileBytes: 262144
   readonly property int maxDmenuOptions: 4000
   readonly property int maxDmenuStringLen: 8192
+  // Model cardinality: a stream that stays under the byte cap can still fan
+  // out into thousands of rows, so provider rows, parsed menu items and
+  // guard result lines each get an explicit count cap and per-field length.
+  readonly property int maxProviderRows: 2000
+  readonly property int maxMenuItems: 6000
+  readonly property int maxGuardLines: 8000
+  readonly property int maxFieldLen: 4096
   function deadlined(argv) {
     return ["timeout", "-k", "2", String(root.procDeadlineSecs)].concat(argv)
   }
@@ -157,9 +164,35 @@ Item {
   // SIGPIPEs the producer) at the limit - so an unterminated multi-megabyte
   // line can't accumulate anywhere before it reaches us. `timeout` still
   // bounds wall time.
+  // Runs a `bash -lc` helper in its own process group, reads at most
+  // limit+1 bytes of stdout, and on overflow SIGKILLs the whole group and
+  // exits 3 (the caller then discards the stream rather than accepting a
+  // silently-truncated one). Exit 4 propagates a non-zero producer status.
+  readonly property string cappedRunnerScript: [
+    "import os,sys,signal,subprocess",
+    "limit=int(sys.argv[1]); script=sys.argv[2]",
+    "p=subprocess.Popen(['bash','-lc',script], stdout=subprocess.PIPE,",
+    "                   stderr=subprocess.DEVNULL, start_new_session=True)",
+    "out=bytearray(); overflow=False",
+    "try:",
+    "    while len(out)<=limit:",
+    "        chunk=p.stdout.read(limit+1-len(out))",
+    "        if not chunk: break",
+    "        out+=chunk",
+    "    overflow=len(out)>limit",
+    "finally:",
+    "    if p.poll() is None:",
+    "        try: os.killpg(p.pid, signal.SIGKILL)",
+    "        except OSError: pass",
+    "    try: rc=p.wait(timeout=2)",
+    "    except Exception: rc=None",
+    "if overflow: sys.exit(3)",
+    "sys.stdout.buffer.write(bytes(out))",
+    "sys.exit(0 if rc in (0, None) else 4)"
+  ].join("\n")
   function bashCapped(script) {
-    return root.deadlined(["bash", "-lc",
-      "{ " + script + " ; } 2>/dev/null | head -c " + String(root.maxProcOutputBytes)])
+    return root.deadlined(["python3", "-c", root.cappedRunnerScript,
+                           String(root.maxProcOutputBytes), script])
   }
 
   readonly property string boundedReaderScript: [
@@ -227,12 +260,17 @@ Item {
     "        except OSError:",
     "            sys.exit(3)",
     "        os.close(dfd); dfd=nfd",
+    "        cst=os.fstat(dfd)",
+    "        # every component must be ours and not group/other writable",
+    "        if cst.st_uid != os.getuid() or (cst.st_mode & 0o022):",
+    "            sys.exit(3)",
     "    st=os.fstat(dfd)",
-    "    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():",
+    "    if not stat.S_ISDIR(st.st_mode):",
     "        sys.exit(3)",
     "    try:",
     "        ex=os.stat(name, dir_fd=dfd, follow_symlinks=False)",
-    "        if not stat.S_ISREG(ex.st_mode):",
+    "        # an existing leaf must be a private regular file we own",
+    "        if not stat.S_ISREG(ex.st_mode) or ex.st_uid != os.getuid() or (ex.st_mode & 0o077):",
     "            sys.exit(4)",
     "    except FileNotFoundError:",
     "        pass",
@@ -417,22 +455,35 @@ Item {
     "import os,sys,stat",
     "sel,done,has,val=sys.argv[1],sys.argv[2],sys.argv[3]=='1',sys.argv[4]",
     "uid=os.getuid()",
-    "roots=[r for r in (os.environ.get('XDG_RUNTIME_DIR'),os.environ.get('TMPDIR'),'/tmp','/var/tmp') if r]",
-    "def under_root(d):",
-    "    try: rp=os.path.realpath(d)",
-    "    except OSError: return False",
-    "    return any(rp==r or rp.startswith(r.rstrip('/')+'/') for r in roots)",
+    "roots=[os.path.realpath(r) for r in (os.environ.get('XDG_RUNTIME_DIR'),os.environ.get('TMPDIR'),'/tmp','/var/tmp') if r]",
+    "def dir_ok(st):",
+    "    # our own dir, or a sticky world-writable temp dir (/tmp-style)",
+    "    return stat.S_ISDIR(st.st_mode) and (st.st_uid==uid or ((st.st_mode & stat.S_ISVTX) and (st.st_mode & 0o002)))",
+    "def open_parent(d):",
+    "    # d must start at one of the temp roots; walk the remainder",
+    "    # component-by-component with held FDs, O_NOFOLLOW past the root.",
+    "    comps=[c for c in d.split('/') if c]",
+    "    root=None; ri=0",
+    "    for r in roots:",
+    "        rc=[c for c in r.split('/') if c]",
+    "        if comps[:len(rc)]==rc: root=r; ri=len(rc); break",
+    "    if root is None: return None",
+    "    try: fd=os.open(root, os.O_RDONLY|os.O_DIRECTORY)",
+    "    except OSError: return None",
+    "    for c in comps[ri:]:",
+    "        try: nfd=os.open(c, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=fd)",
+    "        except OSError: os.close(fd); return None",
+    "        os.close(fd); fd=nfd",
+    "        if not dir_ok(os.fstat(fd)): os.close(fd); return None",
+    "    return fd",
     "def slot(p, data):",
     "    if not (p.startswith('/') and '..' not in p.split('/') and '\\0' not in p): return",
     "    d,name=os.path.dirname(p),os.path.basename(p)",
-    "    if not name or '/' in name or not under_root(d): return",
-    "    try: dfd=os.open(d, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
-    "    except OSError: return",
+    "    if not name or '/' in name: return",
+    "    dfd=open_parent(d)",
+    "    if dfd is None: return",
     "    try:",
-    "        ds=os.fstat(dfd)",
-    "        if not stat.S_ISDIR(ds.st_mode): return",
-    "        # our own dir, or a sticky world-writable temp dir (/tmp-style)",
-    "        if ds.st_uid!=uid and not ((ds.st_mode & stat.S_ISVTX) and (ds.st_mode & 0o002)): return",
+    "        if not dir_ok(os.fstat(dfd)): return",
     "        try:",
     "            ex=os.stat(name, dir_fd=dfd, follow_symlinks=False)",
     "            if not stat.S_ISREG(ex.st_mode) or ex.st_uid!=uid or (ex.st_mode & 0o077): return",
@@ -586,7 +637,23 @@ Item {
   }
 
   function parseMenuJsonc(raw) {
-    return MenuModel.parseMenuJsonc(raw)
+    var items = MenuModel.parseMenuJsonc(raw)
+    if (!Array.isArray(items)) return []
+    // Fail closed on an oversized menu file: an unfamiliar/huge one is
+    // dropped rather than fanned out into the model.
+    if (items.length > root.maxMenuItems) return []
+    // Clamp the free-text fields that reach QML text/actions.
+    var keys = ["id", "parent", "label", "title", "target", "description",
+                "action", "provider", "icon", "iconFont", "when", "checked"]
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i]
+      for (var k = 0; k < keys.length; k++) {
+        if (typeof it[keys[k]] === "string") it[keys[k]] = it[keys[k]].slice(0, root.maxFieldLen)
+      }
+      if (Array.isArray(it.aliases))
+        it.aliases = it.aliases.slice(0, 64).map(function(a) { return String(a).slice(0, root.maxFieldLen) })
+    }
+    return items
   }
 
   // Merge defaults + user extension. Later entries override earlier ones
@@ -715,13 +782,13 @@ Item {
     var lines = String(rows || "").split("\n")
     var providerRows = []
     var takenIds = ({})
-    for (var i = 0; i < lines.length; i++) {
+    for (var i = 0; i < lines.length && providerRows.length < root.maxProviderRows; i++) {
       var line = lines[i].trim()
       if (!line) continue
       var parts = line.split("\t")
-      var label = parts[0] || ""
-      var value = parts[1] || parts[0] || ""
-      var current = parts[2] || ""
+      var label = String(parts[0] || "").slice(0, root.maxFieldLen)
+      var value = String(parts[1] || parts[0] || "").slice(0, root.maxFieldLen)
+      var current = String(parts[2] || "").slice(0, root.maxFieldLen)
       if (!label) continue
       // Distinct values can slugify alike — Fira Code and Fira-Code both give
       // fira-code — and a repeated id is dropped, which would silently lose a
@@ -1258,8 +1325,10 @@ Item {
           providerProc.collected += data + "\n"
       }
     }
-    onExited: {
-      if (providerProc.revision === root.providerRevision) {
+    onExited: function(exitCode) {
+      // cappedRunnerScript exits non-zero on overflow (3) or a failed
+      // producer (4); discard the stream in either case.
+      if (exitCode === 0 && providerProc.revision === root.providerRevision) {
         root.mergeProviderRows(providerProc.collected, providerProc.menuId, providerProc.providerKey)
         if (root.filterText.trim()) root.loadProvidersForSearch()
       }
@@ -1385,8 +1454,8 @@ Item {
       var nextWhen = ({})
       var nextChecked = ({})
       var lines = guardProc.collected.split("\n")
-      for (var i = 0; i < lines.length; i++) {
-        var line = lines[i].trim()
+      for (var i = 0; i < lines.length && i < root.maxGuardLines; i++) {
+        var line = lines[i].trim().slice(0, root.maxFieldLen)
         if (!line) continue
         var colon = line.lastIndexOf(":")
         if (colon < 0) continue
