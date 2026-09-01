@@ -159,42 +159,58 @@ Item {
     "    os.close(fd)"
   ].join("\n")
 
-  // Writes go through the same kind of helper, not FileView.atomicWrites:
-  // the target directory is created then re-checked to be a real directory
-  // owned by this user (not a symlink swap), any pre-existing target must be
-  // a regular file (bail on a planted symlink), and the payload lands via an
-  // O_EXCL temp inode in that same directory + os.replace(), which renames
-  // the link itself and never writes through it.
+  // Writes: every step after the leaf directory is opened is relative to
+  // that held directory fd, so the path is resolved once and never re-walked
+  // (no TOCTOU between check, create and rename). The dir is opened
+  // O_DIRECTORY|O_NOFOLLOW (a symlinked state dir fails the open) and
+  // fstat-checked for S_ISDIR + our uid; any existing target must be a
+  // regular non-symlink file; the temp is created O_CREAT|O_EXCL|O_NOFOLLOW
+  // mode 0600 via openat, written in a short-write loop, fsync'd, then
+  // renameat'd over the target, and the directory itself is fsync'd.
   readonly property string boundedWriterScript: [
-    "import os,sys,stat,tempfile",
-    "data=sys.argv[1].encode(); path=sys.argv[2]; d=os.path.dirname(path)",
+    "import os,sys,stat",
+    "data=sys.argv[1].encode(); path=sys.argv[2]",
+    "d=os.path.dirname(path); name=os.path.basename(path); tmp='.'+name+'.new'",
     "try:",
     "    os.makedirs(d, exist_ok=True)",
     "except OSError:",
     "    sys.exit(2)",
     "try:",
-    "    st=os.lstat(d)",
+    "    dfd=os.open(d, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
     "except OSError:",
-    "    sys.exit(2)",
-    "if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():",
     "    sys.exit(3)",
     "try:",
-    "    if not stat.S_ISREG(os.lstat(path).st_mode):",
+    "    dst=os.fstat(dfd)",
+    "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid():",
+    "        sys.exit(3)",
+    "    try:",
+    "        ex=os.stat(name, dir_fd=dfd, follow_symlinks=False)",
+    "        if not stat.S_ISREG(ex.st_mode):",
+    "            sys.exit(4)",
+    "    except FileNotFoundError:",
+    "        pass",
+    "    except OSError:",
     "        sys.exit(4)",
-    "except FileNotFoundError:",
-    "    pass",
-    "except OSError:",
-    "    sys.exit(4)",
-    "fd,tmp=tempfile.mkstemp(prefix='.omamenu-', dir=d)",
-    "try:",
-    "    os.write(fd, data); os.fchmod(fd, 0o644); os.close(fd)",
-    "    os.replace(tmp, path)",
-    "except BaseException:",
-    "    try: os.close(fd)",
-    "    except OSError: pass",
-    "    try: os.unlink(tmp)",
-    "    except OSError: pass",
-    "    raise"
+    "    try:",
+    "        os.unlink(tmp, dir_fd=dfd)",
+    "    except OSError:",
+    "        pass",
+    "    fd=os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600, dir_fd=dfd)",
+    "    try:",
+    "        mv=memoryview(data)",
+    "        while mv:",
+    "            mv=mv[os.write(fd, mv):]",
+    "        os.fsync(fd)",
+    "    finally:",
+    "        os.close(fd)",
+    "    try:",
+    "        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)",
+    "    except OSError:",
+    "        os.unlink(tmp, dir_fd=dfd)",
+    "        raise",
+    "    os.fsync(dfd)",
+    "finally:",
+    "    os.close(dfd)"
   ].join("\n")
 
   function readBounded(proc, path, limit) {
