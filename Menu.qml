@@ -50,8 +50,10 @@ Item {
   // remembers its own knobs, keyed by theme slug, in one small JSON file
   // only this menu reads. Every knob has an inherit sentinel so a theme with
   // no saved profile of its own renders exactly like the stock menu.
-  readonly property string lookConfigDir: Quickshell.env("HOME") + "/.local/state/omarchy/io.github.omamenu"
-  readonly property string lookConfigPath: lookConfigDir + "/style.json"
+  readonly property string lookConfigChain: ".local/state/omarchy/io.github.omamenu"
+  readonly property string lookConfigLeaf: "style.json"
+  readonly property string lookConfigDir: Quickshell.env("HOME") + "/" + lookConfigChain
+  readonly property string lookConfigPath: lookConfigDir + "/" + lookConfigLeaf
   // Same file OmaShuffle reads to know the active theme.
   readonly property string currentThemeNamePath: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme.name"
 
@@ -150,6 +152,16 @@ Item {
     return ["timeout", "-k", "2", String(root.procDeadlineSecs)].concat(argv)
   }
 
+  // Run a `bash -lc` helper with a hard producer-side byte ceiling: the
+  // script's stdout is piped through `head -c`, which closes the pipe (and
+  // SIGPIPEs the producer) at the limit - so an unterminated multi-megabyte
+  // line can't accumulate anywhere before it reaches us. `timeout` still
+  // bounds wall time.
+  function bashCapped(script) {
+    return root.deadlined(["bash", "-lc",
+      "{ " + script + " ; } 2>/dev/null | head -c " + String(root.maxProcOutputBytes)])
+  }
+
   readonly property string boundedReaderScript: [
     "import os,sys,stat",
     "path=sys.argv[1]; limit=int(sys.argv[2])",
@@ -183,21 +195,40 @@ Item {
   // regular non-symlink file; the temp is created O_CREAT|O_EXCL|O_NOFOLLOW
   // mode 0600 via openat, written in a short-write loop, fsync'd, then
   // renameat'd over the target, and the directory itself is fsync'd.
+  // argv: <json bytes> <chain> <leaf name>, where <chain> is the state dir
+  // split on '/' relative to $HOME. Starting from an fd on $HOME, each
+  // component is mkdir'd (0700) then re-opened O_DIRECTORY|O_NOFOLLOW - so
+  // no element of the chain can be a symlink an attacker planted - and the
+  // held fd is advanced. The final dir fd is fstat-checked (S_ISDIR + our
+  // uid); any existing leaf must be a regular non-symlink file; the temp
+  // uses a random adjacent name created O_CREAT|O_EXCL|O_NOFOLLOW 0600 via
+  // openat; the body is written in a short-write loop and fsync'd; then
+  // renameat over the leaf and the directory fd is fsync'd. Every create,
+  // stat, open and rename is relative to a held fd, never a re-walked path.
   readonly property string boundedWriterScript: [
     "import os,sys,stat",
-    "data=sys.argv[1].encode(); path=sys.argv[2]",
-    "d=os.path.dirname(path); name=os.path.basename(path); tmp='.'+name+'.new'",
+    "data=sys.argv[1].encode(); chain=[c for c in sys.argv[2].split('/') if c]; name=sys.argv[3]",
+    "if '..' in chain or '..' in (name, '.') or '/' in name:",
+    "    sys.exit(5)",
     "try:",
-    "    os.makedirs(d, exist_ok=True)",
+    "    dfd=os.open(os.path.expanduser('~'), os.O_RDONLY|os.O_DIRECTORY)",
     "except OSError:",
     "    sys.exit(2)",
     "try:",
-    "    dfd=os.open(d, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
-    "except OSError:",
-    "    sys.exit(3)",
-    "try:",
-    "    dst=os.fstat(dfd)",
-    "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid():",
+    "    for c in chain:",
+    "        try:",
+    "            os.mkdir(c, 0o700, dir_fd=dfd)",
+    "        except FileExistsError:",
+    "            pass",
+    "        except OSError:",
+    "            sys.exit(2)",
+    "        try:",
+    "            nfd=os.open(c, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=dfd)",
+    "        except OSError:",
+    "            sys.exit(3)",
+    "        os.close(dfd); dfd=nfd",
+    "    st=os.fstat(dfd)",
+    "    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():",
     "        sys.exit(3)",
     "    try:",
     "        ex=os.stat(name, dir_fd=dfd, follow_symlinks=False)",
@@ -207,10 +238,7 @@ Item {
     "        pass",
     "    except OSError:",
     "        sys.exit(4)",
-    "    try:",
-    "        os.unlink(tmp, dir_fd=dfd)",
-    "    except OSError:",
-    "        pass",
+    "    tmp='.'+name+'.'+os.urandom(8).hex()",
     "    fd=os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600, dir_fd=dfd)",
     "    try:",
     "        mv=memoryview(data)",
@@ -222,7 +250,8 @@ Item {
     "    try:",
     "        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)",
     "    except OSError:",
-    "        os.unlink(tmp, dir_fd=dfd)",
+    "        try: os.unlink(tmp, dir_fd=dfd)",
+    "        except OSError: pass",
     "        raise",
     "    os.fsync(dfd)",
     "finally:",
@@ -241,7 +270,7 @@ Item {
   function writeLookConfig(text) {
     lookConfigWriteProc.command = ["timeout", "-k", "2", String(root.readDeadlineSecs),
                                    "python3", "-c", root.boundedWriterScript,
-                                   String(text), root.lookConfigPath]
+                                   String(text), root.lookConfigChain, root.lookConfigLeaf]
     lookConfigWriteProc.running = true
   }
 
@@ -375,27 +404,63 @@ Item {
   // selection payload, fsyncs, and always touches doneFile last so a waiting
   // caller is released. argv: selectionFile, doneFile, hasSelection, value.
   readonly property int maxSelectionBytes: 65536
+  // select/input result-file writer. The two paths come from the IPC payload;
+  // the stock `omarchy-menu-select` / `-input` callers mktemp them under
+  // $TMPDIR, so a result slot must resolve into $XDG_RUNTIME_DIR / $TMPDIR /
+  // /tmp / /var/tmp (blocks e.g. ~/.bashrc), its parent must be a real
+  // directory (O_NOFOLLOW) owned by us, and any pre-existing slot must be a
+  // private (0600) regular file we own - which is exactly what mktemp leaves
+  // and not an arbitrary user file. The write itself is an O_EXCL adjacent
+  // temp + renameat, all relative to the held parent fd; doneFile is only
+  // ever created/left as an empty 0600 file so a waiting caller is released.
   readonly property string resultWriterScript: [
-    "import os,sys",
+    "import os,sys,stat",
     "sel,done,has,val=sys.argv[1],sys.argv[2],sys.argv[3]=='1',sys.argv[4]",
-    "def ok(p): return p.startswith('/') and '..' not in p.split('/') and '\\0' not in p",
-    "def touch(p, data=None):",
-    "    if not ok(p): return",
-    "    flags=os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW",
-    "    if data is not None: flags|=os.O_TRUNC",
+    "uid=os.getuid()",
+    "roots=[r for r in (os.environ.get('XDG_RUNTIME_DIR'),os.environ.get('TMPDIR'),'/tmp','/var/tmp') if r]",
+    "def under_root(d):",
+    "    try: rp=os.path.realpath(d)",
+    "    except OSError: return False",
+    "    return any(rp==r or rp.startswith(r.rstrip('/')+'/') for r in roots)",
+    "def slot(p, data):",
+    "    if not (p.startswith('/') and '..' not in p.split('/') and '\\0' not in p): return",
+    "    d,name=os.path.dirname(p),os.path.basename(p)",
+    "    if not name or '/' in name or not under_root(d): return",
+    "    try: dfd=os.open(d, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
+    "    except OSError: return",
     "    try:",
-    "        fd=os.open(p, flags, 0o600)",
-    "    except OSError:",
-    "        return",
-    "    try:",
-    "        if data is not None:",
+    "        ds=os.fstat(dfd)",
+    "        if not stat.S_ISDIR(ds.st_mode): return",
+    "        # our own dir, or a sticky world-writable temp dir (/tmp-style)",
+    "        if ds.st_uid!=uid and not ((ds.st_mode & stat.S_ISVTX) and (ds.st_mode & 0o002)): return",
+    "        try:",
+    "            ex=os.stat(name, dir_fd=dfd, follow_symlinks=False)",
+    "            if not stat.S_ISREG(ex.st_mode) or ex.st_uid!=uid or (ex.st_mode & 0o077): return",
+    "        except FileNotFoundError:",
+    "            pass",
+    "        except OSError:",
+    "            return",
+    "        if data is None:",
+    "            try: os.close(os.open(name, os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW, 0o600, dir_fd=dfd))",
+    "            except OSError: pass",
+    "            return",
+    "        tmp='.'+name+'.'+os.urandom(8).hex()",
+    "        fd=os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600, dir_fd=dfd)",
+    "        try:",
     "            mv=memoryview(data[:65536])",
     "            while mv: mv=mv[os.write(fd, mv):]",
     "            os.fsync(fd)",
+    "        finally:",
+    "            os.close(fd)",
+    "        try:",
+    "            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)",
+    "        except OSError:",
+    "            try: os.unlink(tmp, dir_fd=dfd)",
+    "            except OSError: pass",
     "    finally:",
-    "        os.close(fd)",
-    "if has: touch(sel, (val + '\\n').encode())",
-    "touch(done)"
+    "        os.close(dfd)",
+    "if has: slot(sel, (val + '\\n').encode())",
+    "slot(done, None)"
   ].join("\n")
 
   function finishRequest(selection) {
@@ -640,7 +705,7 @@ Item {
     providerProc.providerKey = entry.provider
     providerProc.revision = root.providerRevision
     providerProc.collected = ""
-    providerProc.command = root.deadlined(["bash", "-lc", spec.script])
+    providerProc.command = root.bashCapped(spec.script)
     providerProc.running = true
   }
 
@@ -1294,7 +1359,7 @@ Item {
       return
     }
     guardProc.collected = ""
-    guardProc.command = root.deadlined(["bash", "-lc", script])
+    guardProc.command = root.bashCapped(script)
     guardProc.running = true
   }
 
