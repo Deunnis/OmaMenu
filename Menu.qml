@@ -111,7 +111,7 @@ Item {
       transparency: root.cfgTransparency
     }
     root.lookProfiles = next
-    lookConfigFile.setText(JSON.stringify(next, null, 2) + "\n")
+    root.writeLookConfig(JSON.stringify(next, null, 2) + "\n")
   }
 
   // Drops this theme's saved knobs entirely rather than writing back today's
@@ -122,19 +122,19 @@ Item {
     for (var k in root.lookProfiles) if (k !== root.currentThemeSlug) next[k] = root.lookProfiles[k]
     root.lookProfiles = next
     root.applyProfileForCurrentTheme()
-    lookConfigFile.setText(JSON.stringify(next, null, 2) + "\n")
+    root.writeLookConfig(JSON.stringify(next, null, 2) + "\n")
   }
 
-  // style.json lives under ~/.local/state where another local process could
-  // plant a symlink or an oversized file at this exact path before this
-  // plugin ever creates it (the same TOCTOU shape OmaShuffle's state.json
-  // defends against). Read it through a descriptor-pinned, size-capped
-  // reader rather than a plain FileView.text() - opened once with
-  // O_NOFOLLOW|O_NONBLOCK, fstat-checked on that same descriptor to require
-  // a regular file, and read up to a fixed byte cap. Writes still go through
-  // FileView's atomicWrites, same as OmaShuffle.
+  // style.json and current/theme.name both live under ~/.local/state, where
+  // another local process could plant a symlink, a FIFO, or an oversized
+  // file at the path before this plugin touches it. Every read here goes
+  // through a descriptor-pinned, byte-capped, deadlined helper rather than a
+  // FileView: `timeout` bounds wall time, `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`
+  // refuses a symlink and never blocks on a FIFO, an `fstat` on that same
+  // descriptor requires a regular file, and reads stop at limit+1 bytes.
   readonly property int maxLookConfigBytes: 65536
-  readonly property string lookConfigReaderScript: [
+  readonly property int readDeadlineSecs: 5
+  readonly property string boundedReaderScript: [
     "import os,sys,stat",
     "path=sys.argv[1]; limit=int(sys.argv[2])",
     "try:",
@@ -146,7 +146,10 @@ Item {
     "        sys.exit(3)",
     "    chunks=[]; total=0",
     "    while total <= limit:",
-    "        chunk=os.read(fd, (limit + 1) - total)",
+    "        try:",
+    "            chunk=os.read(fd, (limit + 1) - total)",
+    "        except BlockingIOError:",
+    "            break",
     "        if not chunk: break",
     "        chunks.append(chunk); total += len(chunk)",
     "    if total > limit:",
@@ -156,10 +159,58 @@ Item {
     "    os.close(fd)"
   ].join("\n")
 
-  function readLookConfig() {
-    lookConfigReadProc.command = ["python3", "-c", root.lookConfigReaderScript,
-                                   root.lookConfigPath, String(root.maxLookConfigBytes)]
-    lookConfigReadProc.running = true
+  // Writes go through the same kind of helper, not FileView.atomicWrites:
+  // the target directory is created then re-checked to be a real directory
+  // owned by this user (not a symlink swap), any pre-existing target must be
+  // a regular file (bail on a planted symlink), and the payload lands via an
+  // O_EXCL temp inode in that same directory + os.replace(), which renames
+  // the link itself and never writes through it.
+  readonly property string boundedWriterScript: [
+    "import os,sys,stat,tempfile",
+    "data=sys.argv[1].encode(); path=sys.argv[2]; d=os.path.dirname(path)",
+    "try:",
+    "    os.makedirs(d, exist_ok=True)",
+    "except OSError:",
+    "    sys.exit(2)",
+    "try:",
+    "    st=os.lstat(d)",
+    "except OSError:",
+    "    sys.exit(2)",
+    "if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():",
+    "    sys.exit(3)",
+    "try:",
+    "    if not stat.S_ISREG(os.lstat(path).st_mode):",
+    "        sys.exit(4)",
+    "except FileNotFoundError:",
+    "    pass",
+    "except OSError:",
+    "    sys.exit(4)",
+    "fd,tmp=tempfile.mkstemp(prefix='.omamenu-', dir=d)",
+    "try:",
+    "    os.write(fd, data); os.fchmod(fd, 0o644); os.close(fd)",
+    "    os.replace(tmp, path)",
+    "except BaseException:",
+    "    try: os.close(fd)",
+    "    except OSError: pass",
+    "    try: os.unlink(tmp)",
+    "    except OSError: pass",
+    "    raise"
+  ].join("\n")
+
+  function readBounded(proc, path, limit) {
+    proc.command = ["timeout", "-k", "2", String(root.readDeadlineSecs),
+                    "python3", "-c", root.boundedReaderScript, path, String(limit)]
+    proc.running = true
+  }
+
+  function readLookConfig() { root.readBounded(lookConfigReadProc, root.lookConfigPath, root.maxLookConfigBytes) }
+  function readThemeName() { root.readBounded(themeNameReadProc, root.currentThemeNamePath, 256) }
+
+  function writeLookConfig(text) {
+    lookConfigWriteProc.command = ["timeout", "-k", "2", String(root.readDeadlineSecs),
+                                   "python3", "-c", root.boundedWriterScript,
+                                   String(text), root.lookConfigPath]
+    lookConfigWriteProc.running = true
   }
 
   Process {
@@ -173,43 +224,40 @@ Item {
   }
 
   Process {
-    id: lookConfigDirProc
-    command: ["mkdir", "-p", root.lookConfigDir]
-    running: true
-    onExited: root.readLookConfig()
+    id: lookConfigWriteProc
+    onExited: function (code) {
+      if (code !== 0) console.warn("Menu Look: could not write style.json (exit " + code + ")")
+    }
   }
 
-  // Write-only as far as this FileView is concerned - all reads go through
-  // readLookConfig() above. Deliberately NOT watchChanges: true - pairing
-  // that with preload: false on a path that doesn't exist yet made
-  // setText() silently no-op in testing (Quickshell 0.3.1). Harmless to
-  // drop: this menu is a single keepLoaded instance for the whole session,
-  // so nothing else is ever writing this file out from under it.
-  FileView {
-    id: lookConfigFile
-    path: root.lookConfigPath
-    preload: false
-    printErrors: false
-    atomicWrites: true
-  }
-
-  // Watched so switching themes - this plugin's own picker, `omarchy theme
-  // set`, a rotator like OmaShuffle - re-applies that theme's Menu Look live,
-  // no shell restart needed.
-  FileView {
-    id: themeNameFile
-    path: root.currentThemeNamePath
-    watchChanges: true
-    printErrors: false
-    onLoaded: {
+  Process {
+    id: themeNameReadProc
+    stdout: StdioCollector { id: themeNameReadOut; waitForEnd: true }
+    onExited: function (code) {
       // Same slug shape OmaShuffle validates theme names against before
-      // trusting one - this value becomes a JSON object key and gets
-      // written back into our own state file.
-      var slug = String(text() || "").trim().slice(0, 128)
+      // trusting one - this value becomes a JSON object key and is written
+      // back into our own state file.
+      var slug = (code === 0 ? String(themeNameReadOut.text || "") : "").trim().slice(0, 128)
       root.currentThemeSlug = /^[a-z0-9][a-z0-9._-]*$/.test(slug) ? slug : "default"
     }
-    onLoadFailed: root.currentThemeSlug = "default"
-    onFileChanged: reload()
+  }
+
+  Component.onCompleted: {
+    root.readLookConfig()
+    root.readThemeName()
+  }
+
+  // A FileView used only as a change notifier (no read through it) so
+  // switching themes - this plugin's picker, `omarchy theme set`, a rotator
+  // like OmaShuffle - re-applies that theme's Menu Look live. The content is
+  // pulled by the bounded reader above.
+  FileView {
+    id: themeNameWatcher
+    path: root.currentThemeNamePath
+    preload: false
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.readThemeName()
   }
   onCurrentThemeSlugChanged: root.applyProfileForCurrentTheme()
 

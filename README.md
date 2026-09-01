@@ -42,8 +42,9 @@ and `BarWidget.qml` are byte-for-byte the built-in menu.
 ## Requirements
 
 - **Omarchy 4** with its Quickshell-based shell.
-- **`python3`** — used once per load to read this plugin's own small state file
-  safely (see *Notes for reviewers*). Present on a normal Omarchy install.
+- **`python3`** — used for the bounded, `O_NOFOLLOW` read and write of this
+  plugin's own small state file (see *Notes for reviewers*). Present on a
+  normal Omarchy install.
 
 No network. No elevated privileges. No packages.
 
@@ -104,29 +105,40 @@ All in `Menu.qml`, at marked seams:
 - A `kind: "action"` **Menu Look** row is injected under Style and intercepted
   in `activateIndex()` to open `MenuLookEditor.qml` in place of the row list;
   `Esc` / `←` in that view route to `goBack()`.
-- A `FileView` (write path) + a bounded-reader `Process` for `style.json`, a
-  `FileView` watching the active-theme name, and a `mkdir -p` `Process` for
-  the state dir.
+- Bounded-reader / bounded-writer `Process` helpers for `style.json` and the
+  active-theme name, plus one `FileView` used purely as a change notifier for
+  the theme name.
 
 `MenuLookEditor.qml` is the only new UI file. `MenuModel.js` and
 `BarWidget.qml` are unchanged.
 
 ## Notes for reviewers
 
-- **No network, no privileged calls, installs nothing.** The only processes it
-  runs are `mkdir -p` for its state dir and one `python3 -c` bounded reader.
-- **`style.json` is read through a descriptor-pinned, size-capped reader**, not
-  a plain `FileView.text()` — it lives under `~/.local/state` where another
-  local process could plant a symlink or an oversized file at the path before
-  this plugin creates it. The reader opens the path once with
-  `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, `fstat`s that same descriptor to
-  require a regular file, and reads at most 64 KiB. Writes go through
-  `FileView` with `atomicWrites` (same as OmaShuffle's `state.json`).
-- **The active theme name** comes from `~/.local/state/omarchy/current/theme.name`
-  (the same file OmaShuffle reads). It's only ever used as a JSON object key
-  and is validated against `^[a-z0-9][a-z0-9._-]*$`, length-capped, before use.
+- **No network, no privileged calls, installs nothing.** The only subprocesses
+  are `timeout … python3 -c` helpers for reading and writing this plugin's own
+  state file.
+- **Every file read goes through a descriptor-pinned, byte-capped, deadlined
+  helper** — never a `FileView.text()`. `style.json` and
+  `~/.local/state/omarchy/current/theme.name` both live under `~/.local/state`
+  where another local process could plant a symlink, a FIFO, or an oversized
+  file first. Each read: `timeout -k 2 5` bounds wall time,
+  `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` refuses a symlink and never blocks on a
+  FIFO, an `fstat` on that descriptor requires a regular file, and the read
+  stops at `limit + 1` bytes (64 KiB for `style.json`, 256 for the theme name).
+- **The write helper** creates the state dir then re-checks it is a real
+  directory owned by this uid (not a symlink swap), refuses to proceed if the
+  target already exists as anything but a regular file, and lands the payload
+  through an `O_EXCL` `mkstemp` in that same directory followed by
+  `os.replace()` — which renames the link itself and never writes through it.
+- **The theme name** is only ever used as a JSON object key; it's
+  `^[a-z0-9][a-z0-9._-]*$`-validated and length-capped before use.
 - **Nothing global is written.** No `shell.toml`, no Hyprland config, no theme
-  files — only the one state file above.
+  files — only `~/.local/state/omarchy/io.github.omamenu/style.json`.
+- **The rest of the menu is unmodified `omarchy.menu`.** `finishRequest()` (the
+  select/dmenu result-file writer), the provider and guard `bash -lc` helpers,
+  and the JSONC menu-file `FileView`s are byte-for-byte the built-in menu — run
+  `diff` against `$OMARCHY_PATH/shell/plugins/menu/`. This is a `clonedFrom`
+  plugin; those paths are Omarchy's, not introduced here.
 
 ## Known limitations
 
