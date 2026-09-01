@@ -3,8 +3,8 @@
 A clone of the built-in [Omarchy](https://omarchy.org/) command menu
 (`omarchy.menu`) with one addition: a **Menu Look** row under Style that lets
 you scale this menu's size, round its corners, set its border width, and
-adjust its transparency — live, as you drag — without touching the theme or
-any other part of the shell.
+adjust its transparency — live, as you drag, saved per theme — without
+touching the theme itself or any other part of the shell.
 
 ## Why a clone
 
@@ -31,20 +31,26 @@ slider and the card restyles immediately:
 | Border width | 0–6 px | theme default |
 | Transparency | 0–90% | 0% (opaque) |
 
-**Reset to theme defaults** clears all four back to "inherit from the shell
-theme" — an unconfigured install renders pixel-identical to the stock menu.
+**Each theme remembers its own four knobs.** Switch themes (`omarchy theme
+set`, the theme picker, a rotator like OmaShuffle) and Menu Look switches
+with it, live, no restart — a theme you haven't touched yet just renders with
+the defaults above. **Reset to theme defaults** drops the *current* theme's
+saved knobs back to "inherit from the shell theme", leaving every other
+theme's profile alone.
 
-Settings are stored in `~/.local/state/omarchy/deunnis.menu/style.json` and
-apply only to this menu; the bar, panels, and every other surface are
-untouched.
+Settings are stored in `~/.local/state/omarchy/deunnis.menu/style.json`
+(keyed by theme slug, e.g. `catppuccin`, `tokyo-night`) and apply only to
+this menu; the bar, panels, and every other surface are untouched.
 
 ## What's changed vs. the built-in menu
 
 - `Menu.qml`: `cornerRadius` and the card's border width read from the new
-  config (falling back to the same `Style.*` expressions as before); the card
-  gets a `scale` + background-alpha override; a "Menu Look" row is injected
-  under Style and intercepted in `activateIndex()` to open `MenuLookEditor`
-  in place of the row list.
+  per-theme config (falling back to the same `Style.*` expressions as
+  before); the card gets a `scale` + background-alpha override; a "Menu
+  Look" row is injected under Style and intercepted in `activateIndex()` to
+  open `MenuLookEditor` in place of the row list; a `FileView` on
+  `~/.local/state/omarchy/current/theme.name` (the same file OmaShuffle
+  reads) re-applies the active theme's profile whenever it changes.
 - `MenuLookEditor.qml`: new file, the sliders view.
 - `MenuModel.js`, `BarWidget.qml`: unchanged from the built-in menu.
 

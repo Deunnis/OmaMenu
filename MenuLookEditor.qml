@@ -86,7 +86,8 @@ Item {
     Text {
       width: parent.width
       wrapMode: Text.WordWrap
-      text: "Applies to this menu only, live as you drag. Esc or ← goes back."
+      text: "Applies to this menu only, live as you drag, saved per theme — "
+        + "switching themes switches these too. Esc or ← goes back."
       color: root.fg
       opacity: 0.55
       font.family: root.fam

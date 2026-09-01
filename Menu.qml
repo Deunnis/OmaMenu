@@ -46,11 +46,18 @@ Item {
   property string fontFamily: Style.font.menuFamily
 
   // ------------------------------------------------------------------ look
-  // This fork adds a live "Menu Look" editor (a row under Style). It writes a
-  // tiny JSON file that only this menu reads; every knob has an inherit
-  // sentinel so an untouched install renders exactly like the stock menu.
+  // This fork adds a live "Menu Look" editor (a row under Style). Each theme
+  // remembers its own knobs, keyed by theme slug, in one small JSON file
+  // only this menu reads. Every knob has an inherit sentinel so a theme with
+  // no saved profile of its own renders exactly like the stock menu.
   readonly property string lookConfigDir: Quickshell.env("HOME") + "/.local/state/omarchy/deunnis.menu"
   readonly property string lookConfigPath: lookConfigDir + "/style.json"
+  // Same file OmaShuffle reads to know the active theme.
+  readonly property string currentThemeNamePath: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme.name"
+
+  property string currentThemeSlug: "default"
+  property var lookProfiles: ({})    // theme slug -> {scale, cornerRadius, borderWidth, transparency}
+
   property real cfgScale: 1.0        // card render scale
   property int cfgCornerRadius: -1   // -1 -> Style.cornerRadius
   property int cfgBorderWidth: -1    // -1 -> Math.max(1, Style.space(2))
@@ -59,34 +66,63 @@ Item {
   readonly property int effCornerRadius: cfgCornerRadius >= 0 ? cfgCornerRadius : Style.cornerRadius
   readonly property int effBorderWidth: cfgBorderWidth >= 0 ? cfgBorderWidth : Math.max(1, Style.space(2))
 
+  function clampProfile(raw) {
+    var p = raw || {}
+    var s = Number(p.scale)
+    var cr = Number(p.cornerRadius)
+    var bw = Number(p.borderWidth)
+    var t = Number(p.transparency)
+    return {
+      scale: (isFinite(s) && s > 0) ? Math.max(0.8, Math.min(1.5, s)) : 1.0,
+      cornerRadius: (isFinite(cr) && cr >= 0) ? Math.min(24, Math.round(cr)) : -1,
+      borderWidth: (isFinite(bw) && bw >= 0) ? Math.min(6, Math.round(bw)) : -1,
+      transparency: (isFinite(t) && t > 0) ? Math.max(0, Math.min(90, Math.round(t))) : 0
+    }
+  }
+
+  // Loads/replaces the whole per-theme map (startup, or an external edit to
+  // the file) and re-applies whichever theme is current.
   function applyLookConfig(raw) {
-    var c = {}
-    try { c = JSON.parse(raw || "{}") || {} } catch (e) { c = {} }
-    var s = Number(c.scale)
-    root.cfgScale = (isFinite(s) && s > 0) ? Math.max(0.8, Math.min(1.5, s)) : 1.0
-    var cr = Number(c.cornerRadius)
-    root.cfgCornerRadius = (isFinite(cr) && cr >= 0) ? Math.min(24, Math.round(cr)) : -1
-    var bw = Number(c.borderWidth)
-    root.cfgBorderWidth = (isFinite(bw) && bw >= 0) ? Math.min(6, Math.round(bw)) : -1
-    var t = Number(c.transparency)
-    root.cfgTransparency = (isFinite(t) && t > 0) ? Math.max(0, Math.min(90, Math.round(t))) : 0
+    var parsed = {}
+    try { parsed = JSON.parse(raw || "{}") || {} } catch (e) { parsed = {} }
+    if (Array.isArray(parsed) || typeof parsed !== "object") parsed = {}
+    root.lookProfiles = parsed
+    root.applyProfileForCurrentTheme()
+  }
+
+  // Pulls this theme's saved knobs (or the inherit defaults, for a theme
+  // with none saved) into the live cfg* properties. Called on load and
+  // whenever the active theme changes.
+  function applyProfileForCurrentTheme() {
+    var p = root.clampProfile(root.lookProfiles[root.currentThemeSlug])
+    root.cfgScale = p.scale
+    root.cfgCornerRadius = p.cornerRadius
+    root.cfgBorderWidth = p.borderWidth
+    root.cfgTransparency = p.transparency
   }
 
   function saveLookConfig() {
-    lookConfigFile.setText(JSON.stringify({
+    var next = {}
+    for (var k in root.lookProfiles) next[k] = root.lookProfiles[k]
+    next[root.currentThemeSlug] = {
       scale: Number(root.cfgScale.toFixed(2)),
       cornerRadius: root.cfgCornerRadius,
       borderWidth: root.cfgBorderWidth,
       transparency: root.cfgTransparency
-    }, null, 2) + "\n")
+    }
+    root.lookProfiles = next
+    lookConfigFile.setText(JSON.stringify(next, null, 2) + "\n")
   }
 
+  // Drops this theme's saved knobs entirely rather than writing back today's
+  // theme-derived numbers, so it keeps tracking the theme (not just today's
+  // instance of it) after a reset.
   function resetLookConfig() {
-    root.cfgScale = 1.0
-    root.cfgCornerRadius = -1
-    root.cfgBorderWidth = -1
-    root.cfgTransparency = 0
-    root.saveLookConfig()
+    var next = {}
+    for (var k in root.lookProfiles) if (k !== root.currentThemeSlug) next[k] = root.lookProfiles[k]
+    root.lookProfiles = next
+    root.applyProfileForCurrentTheme()
+    lookConfigFile.setText(JSON.stringify(next, null, 2) + "\n")
   }
 
   Process {
@@ -106,6 +142,23 @@ Item {
     onLoadFailed: root.applyLookConfig("")
     onFileChanged: reload()
   }
+
+  // Watched so switching themes - this plugin's own picker, `omarchy theme
+  // set`, a rotator like OmaShuffle - re-applies that theme's Menu Look live,
+  // no shell restart needed.
+  FileView {
+    id: themeNameFile
+    path: root.currentThemeNamePath
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      var slug = String(text() || "").trim()
+      root.currentThemeSlug = slug.length > 0 ? slug : "default"
+    }
+    onLoadFailed: root.currentThemeSlug = "default"
+    onFileChanged: reload()
+  }
+  onCurrentThemeSlugChanged: root.applyProfileForCurrentTheme()
 
   // JSONC menu definitions. The shell parses both at startup and merges
   // the user file on top of the defaults, so the keybind → IPC → visible
