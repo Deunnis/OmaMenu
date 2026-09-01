@@ -50,7 +50,7 @@ Item {
   // remembers its own knobs, keyed by theme slug, in one small JSON file
   // only this menu reads. Every knob has an inherit sentinel so a theme with
   // no saved profile of its own renders exactly like the stock menu.
-  readonly property string lookConfigDir: Quickshell.env("HOME") + "/.local/state/omarchy/deunnis.menu"
+  readonly property string lookConfigDir: Quickshell.env("HOME") + "/.local/state/omarchy/io.github.omamenu"
   readonly property string lookConfigPath: lookConfigDir + "/style.json"
   // Same file OmaShuffle reads to know the active theme.
   readonly property string currentThemeNamePath: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme.name"

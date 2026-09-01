@@ -72,7 +72,7 @@ instantly:
 
 ## Where it keeps things
 
-One file: `~/.local/state/omarchy/deunnis.menu/style.json`, a small JSON object
+One file: `~/.local/state/omarchy/io.github.omamenu/style.json`, a small JSON object
 keyed by theme slug:
 
 ```json
@@ -130,17 +130,17 @@ All in `Menu.qml`, at marked seams:
 ## Remove
 
 ```bash
-omarchy plugin remove deunnis.menu
+omarchy plugin remove io.github.omamenu
 omarchy restart shell
 ```
 
 The built-in menu takes over again automatically. Delete
-`~/.local/state/omarchy/deunnis.menu/` to clear the saved per-theme looks.
+`~/.local/state/omarchy/io.github.omamenu/` to clear the saved per-theme looks.
 
 ## Development
 
 ```bash
-omarchy plugin validate ~/.config/omarchy/plugins/deunnis.menu
+omarchy plugin validate ~/.config/omarchy/plugins/io.github.omamenu
 /usr/lib/qt6/bin/qmllint -I /usr/lib/qt6/qml -I /usr/share/omarchy/shell \
   Menu.qml MenuLookEditor.qml            # import/unqualified warnings only
 omarchy restart shell                     # plugin QML is cached by URL — a
