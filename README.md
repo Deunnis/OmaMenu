@@ -5,7 +5,15 @@ one thing added: a **Menu Look** row under Style that resizes this menu, rounds
 its corners, sets its border width and its transparency — live, as you drag —
 **saved per theme**, and without touching the bar, panels, or anything else.
 
-<!-- screenshots/root.png screenshots/editor.png screenshots/per-theme.png -->
+![The menu at 1.12x with 14px corners and 40% transparency](screenshots/menu.jpg)
+
+The **Menu Look** editor — every knob previews on the menu itself as you drag:
+
+![Menu Look editor](screenshots/editor.jpg)
+
+Untouched, it's the built-in menu exactly — just with one extra row:
+
+![The Menu Look row under Style](screenshots/plain-menu.png)
 
 ## Is this for you?
 
@@ -42,7 +50,7 @@ No network. No elevated privileges. No packages.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/Deunnis/<repo>.git --enable
+omarchy plugin add https://github.com/Deunnis/OmaMenu.git --enable
 omarchy restart shell
 ```
 
@@ -96,10 +104,12 @@ All in `Menu.qml`, at marked seams:
 - A `kind: "action"` **Menu Look** row is injected under Style and intercepted
   in `activateIndex()` to open `MenuLookEditor.qml` in place of the row list;
   `Esc` / `←` in that view route to `goBack()`.
-- Two `FileView`s + one bounded reader `Process` for the per-theme state file
-  and the active-theme name.
+- A `FileView` (write path) + a bounded-reader `Process` for `style.json`, a
+  `FileView` watching the active-theme name, and a `mkdir -p` `Process` for
+  the state dir.
 
-`MenuLookEditor.qml` is the only new UI file.
+`MenuLookEditor.qml` is the only new UI file. `MenuModel.js` and
+`BarWidget.qml` are unchanged.
 
 ## Notes for reviewers
 
