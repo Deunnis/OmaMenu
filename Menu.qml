@@ -36,8 +36,8 @@ Item {
   }
 
   function refresh() {
-    defaultMenuFile.reload()
-    userMenuFile.reload()
+    root.readDefaultMenu()
+    root.readUserMenu()
     return "ok"
   }
 
@@ -134,6 +134,22 @@ Item {
   // descriptor requires a regular file, and reads stop at limit+1 bytes.
   readonly property int maxLookConfigBytes: 65536
   readonly property int readDeadlineSecs: 5
+
+  // Fork-wide producer/consumer bounds and deadlines. The built-in menu runs
+  // a handful of `bash -lc` helpers (providers, `when:`/`checked:` guards)
+  // and reads two JSONC files; upstream leaves their output and wall time
+  // unbounded. This clone caps every subprocess to `procDeadlineSecs` and
+  // `maxProcOutputBytes`, every menu file to `maxMenuFileBytes`, and the
+  // IPC-supplied dmenu payload to `maxDmenuOptions` * `maxDmenuStringLen`.
+  readonly property int procDeadlineSecs: 8
+  readonly property int maxProcOutputBytes: 262144
+  readonly property int maxMenuFileBytes: 262144
+  readonly property int maxDmenuOptions: 4000
+  readonly property int maxDmenuStringLen: 8192
+  function deadlined(argv) {
+    return ["timeout", "-k", "2", String(root.procDeadlineSecs)].concat(argv)
+  }
+
   readonly property string boundedReaderScript: [
     "import os,sys,stat",
     "path=sys.argv[1]; limit=int(sys.argv[2])",
@@ -261,6 +277,8 @@ Item {
   Component.onCompleted: {
     root.readLookConfig()
     root.readThemeName()
+    root.readDefaultMenu()
+    root.readUserMenu()
   }
 
   // A FileView used only as a change notifier (no read through it) so
@@ -349,6 +367,37 @@ Item {
       ? Math.min(contentMargin * 2 + Math.max(Style.space(220), lookEditor.implicitHeight), panel.height - Style.gapsOut * 2)
       : Math.min(contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight, panel.height - Style.gapsOut * 2)
 
+  // select/input mode result files. Both paths come from the IPC payload
+  // (the caller-side `omarchy-menu-select` / `-input` helpers mktemp them),
+  // so upstream's `bash -c "printf … > $path"` is replaced with a helper
+  // that: rejects a non-absolute path or one with a `..` segment, opens each
+  // with O_WRONLY|O_NOFOLLOW (a planted symlink at the path fails), caps the
+  // selection payload, fsyncs, and always touches doneFile last so a waiting
+  // caller is released. argv: selectionFile, doneFile, hasSelection, value.
+  readonly property int maxSelectionBytes: 65536
+  readonly property string resultWriterScript: [
+    "import os,sys",
+    "sel,done,has,val=sys.argv[1],sys.argv[2],sys.argv[3]=='1',sys.argv[4]",
+    "def ok(p): return p.startswith('/') and '..' not in p.split('/') and '\\0' not in p",
+    "def touch(p, data=None):",
+    "    if not ok(p): return",
+    "    flags=os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW",
+    "    if data is not None: flags|=os.O_TRUNC",
+    "    try:",
+    "        fd=os.open(p, flags, 0o600)",
+    "    except OSError:",
+    "        return",
+    "    try:",
+    "        if data is not None:",
+    "            mv=memoryview(data[:65536])",
+    "            while mv: mv=mv[os.write(fd, mv):]",
+    "            os.fsync(fd)",
+    "    finally:",
+    "        os.close(fd)",
+    "if has: touch(sel, (val + '\\n').encode())",
+    "touch(done)"
+  ].join("\n")
+
   function finishRequest(selection) {
     if (!root.requestActive || !root.doneFile) {
       root.opened = false
@@ -357,15 +406,15 @@ Item {
 
     var activeSelectionFile = root.selectionFile
     var activeDoneFile = root.doneFile
+    var hasSelection = !(selection === null || selection === undefined)
     root.requestActive = false
     root.selectionFile = ""
     root.doneFile = ""
 
-    if (selection === null || selection === undefined) {
-      resultProc.command = ["bash", "-c", ": > " + Util.shellQuote(activeDoneFile)]
-    } else {
-      resultProc.command = ["bash", "-c", "printf '%s\\n' " + Util.shellQuote(selection) + " > " + Util.shellQuote(activeSelectionFile) + "; : > " + Util.shellQuote(activeDoneFile)]
-    }
+    resultProc.command = root.deadlined(["python3", "-c", root.resultWriterScript,
+      activeSelectionFile, activeDoneFile,
+      hasSelection ? "1" : "0",
+      hasSelection ? String(selection).slice(0, root.maxSelectionBytes) : ""])
     resultProc.running = true
   }
 
@@ -591,7 +640,7 @@ Item {
     providerProc.providerKey = entry.provider
     providerProc.revision = root.providerRevision
     providerProc.collected = ""
-    providerProc.command = ["bash", "-lc", spec.script]
+    providerProc.command = root.deadlined(["bash", "-lc", spec.script])
     providerProc.running = true
   }
 
@@ -1071,8 +1120,10 @@ Item {
   function openDmenu(payload) {
     requestSerial += 1
     mode = payload.mode === "input" ? "input" : "select"
-    dmenuPrompt = String(payload.prompt || (mode === "input" ? "Input" : "Select"))
-    dmenuOptions = Array.isArray(payload.options) ? payload.options : []
+    dmenuPrompt = String(payload.prompt || (mode === "input" ? "Input" : "Select")).slice(0, root.maxDmenuStringLen)
+    dmenuOptions = (Array.isArray(payload.options) ? payload.options : [])
+      .slice(0, root.maxDmenuOptions)
+      .map(function(o) { return String(o).slice(0, root.maxDmenuStringLen) })
     selectionFile = String(payload.selectionFile || "")
     doneFile = String(payload.doneFile || "")
     requestActive = !!doneFile
@@ -1137,7 +1188,10 @@ Item {
     property string collected: ""
     property int revision: 0
     stdout: SplitParser {
-      onRead: function(data) { providerProc.collected += data + "\n" }
+      onRead: function(data) {
+        if (providerProc.collected.length < root.maxProcOutputBytes)
+          providerProc.collected += data + "\n"
+      }
     }
     onExited: {
       if (providerProc.revision === root.providerRevision) {
@@ -1168,26 +1222,45 @@ Item {
     }
   }
 
-  // The JSONC sources are watched so live edits to the default file (or the
-  // user extension at ~/.config/omarchy/extensions/omarchy-menu.jsonc) take
-  // effect without restarting the shell.
+  // The two JSONC sources - the packaged default and the user extension at
+  // ~/.config/omarchy/extensions/omarchy-menu.jsonc - are read through the
+  // same bounded, deadlined, O_NOFOLLOW helper as everything else (upstream
+  // reads them with an uncapped FileView). The FileViews below stay only as
+  // change notifiers so live edits still apply without a restart.
+  Process {
+    id: defaultMenuReadProc
+    stdout: StdioCollector { id: defaultMenuOut; waitForEnd: true }
+    onExited: function (code) {
+      root.defaultMenuItems = root.parseMenuJsonc(code === 0 ? defaultMenuOut.text : "")
+      root.rebuildItemsFromSources()
+    }
+  }
+  Process {
+    id: userMenuReadProc
+    stdout: StdioCollector { id: userMenuOut; waitForEnd: true }
+    onExited: function (code) {
+      root.userMenuItems = root.parseMenuJsonc(code === 0 ? userMenuOut.text : "")
+      root.rebuildItemsFromSources()
+    }
+  }
+  function readDefaultMenu() { root.readBounded(defaultMenuReadProc, root.defaultMenuPath, root.maxMenuFileBytes) }
+  function readUserMenu() { root.readBounded(userMenuReadProc, root.userMenuPath, root.maxMenuFileBytes) }
+
   FileView {
     id: defaultMenuFile
     path: root.defaultMenuPath
+    preload: false
     watchChanges: true
     printErrors: false
-    onLoaded: { root.defaultMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
-    onFileChanged: reload()
+    onFileChanged: root.readDefaultMenu()
   }
-
   FileView {
     id: userMenuFile
     path: root.userMenuPath
+    preload: false
     watchChanges: true
     printErrors: false
-    onLoaded: { root.userMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
-    onLoadFailed: { root.userMenuItems = []; root.rebuildItemsFromSources() }
-    onFileChanged: reload()
+    onFileChanged: root.readUserMenu()
   }
 
   // ---------------------------------------------------------------- guards
@@ -1221,7 +1294,7 @@ Item {
       return
     }
     guardProc.collected = ""
-    guardProc.command = ["bash", "-lc", script]
+    guardProc.command = root.deadlined(["bash", "-lc", script])
     guardProc.running = true
   }
 
@@ -1229,7 +1302,10 @@ Item {
     id: guardProc
     property string collected: ""
     stdout: SplitParser {
-      onRead: function(data) { guardProc.collected += data + "\n" }
+      onRead: function(data) {
+        if (guardProc.collected.length < root.maxProcOutputBytes)
+          guardProc.collected += data + "\n"
+      }
     }
     onExited: function(exitCode, exitStatus) {
       // A batch that was killed rather than finished has only told us about
