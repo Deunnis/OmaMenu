@@ -19,3 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+This plugin is a clone of the built-in Omarchy command menu (`omarchy.menu`).
+`MenuModel.js` and `BarWidget.qml` are used unchanged, and `Menu.qml` is a
+lightly-patched fork of the original. Those portions are:
+
+Copyright (c) 37signals LLC (Omarchy, https://github.com/basecamp/omarchy)
+Licensed under the MIT License.
