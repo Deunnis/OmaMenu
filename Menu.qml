@@ -168,31 +168,61 @@ Item {
   // limit+1 bytes of stdout, and on overflow SIGKILLs the whole group and
   // exits 3 (the caller then discards the stream rather than accepting a
   // silently-truncated one). Exit 4 propagates a non-zero producer status.
+  // exit 0 ok / 3 byte overflow / 4 producer failed or unreaped / 5 deadline.
+  // The deadline is enforced here, not by an outer `timeout`: the producer
+  // runs in its own session and stdout is drained non-blocking under a
+  // select() budget, and the finally always TERM->KILLs and reaps the whole
+  // session - on EOF, overflow, the internal deadline, or a SIGTERM from
+  // QML destroying the Process (a handler turns that into the same path).
   readonly property string cappedRunnerScript: [
-    "import os,sys,signal,subprocess",
-    "limit=int(sys.argv[1]); script=sys.argv[2]",
+    "import os,sys,signal,subprocess,select,time",
+    "limit=int(sys.argv[1]); script=sys.argv[2]; budget=float(sys.argv[3])",
+    "class Stop(Exception): pass",
+    "def _sig(*a): raise Stop()",
+    "signal.signal(signal.SIGTERM,_sig); signal.signal(signal.SIGINT,_sig)",
     "p=subprocess.Popen(['bash','-lc',script], stdout=subprocess.PIPE,",
     "                   stderr=subprocess.DEVNULL, start_new_session=True)",
-    "out=bytearray(); overflow=False",
+    "out=bytearray(); overflow=False; expired=False",
+    "end=time.monotonic()+budget",
     "try:",
-    "    while len(out)<=limit:",
-    "        chunk=p.stdout.read(limit+1-len(out))",
-    "        if not chunk: break",
-    "        out+=chunk",
-    "    overflow=len(out)>limit",
+    "    os.set_blocking(p.stdout.fileno(), False)",
+    "    while True:",
+    "        left=end-time.monotonic()",
+    "        if left<=0: expired=True; break",
+    "        r,_,_=select.select([p.stdout],[],[],min(left,0.25))",
+    "        if r:",
+    "            try: chunk=p.stdout.read(65536)",
+    "            except (BlockingIOError,InterruptedError): chunk=None",
+    "            if chunk==b'': break",
+    "            if chunk:",
+    "                out+=chunk",
+    "                if len(out)>limit: overflow=True; break",
+    "        elif p.poll() is not None: break",
+    "except Stop:",
+    "    expired=True",
     "finally:",
-    "    if p.poll() is None:",
-    "        try: os.killpg(p.pid, signal.SIGKILL)",
-    "        except OSError: pass",
-    "    try: rc=p.wait(timeout=2)",
-    "    except Exception: rc=None",
+    "    for s in (signal.SIGTERM, signal.SIGKILL):",
+    "        try: os.killpg(p.pid, s)",
+    "        except OSError: break",
+    "        try:",
+    "            p.wait(timeout=1.5); break",
+    "        except subprocess.TimeoutExpired:",
+    "            continue",
+    "    try: p.wait(timeout=0.5)",
+    "    except Exception: pass",
+    "rc=p.returncode",
     "if overflow: sys.exit(3)",
+    "if expired: sys.exit(5)",
+    "if rc!=0: sys.exit(4)",
     "sys.stdout.buffer.write(bytes(out))",
-    "sys.exit(0 if rc in (0, None) else 4)"
+    "sys.exit(0)"
   ].join("\n")
   function bashCapped(script) {
+    // internal budget is the real deadline; the outer `timeout` is a last
+    // resort a couple of seconds later.
     return root.deadlined(["python3", "-c", root.cappedRunnerScript,
-                           String(root.maxProcOutputBytes), script])
+                           String(root.maxProcOutputBytes), script,
+                           String(root.procDeadlineSecs - 2)])
   }
 
   readonly property string boundedReaderScript: [
@@ -780,9 +810,15 @@ Item {
     var spec = root.providers[providerKey]
     if (!spec) return
     var lines = String(rows || "").split("\n")
+    // Fail closed on cardinality overflow, same as a byte/deadline overflow:
+    // a provider decision set that would exceed the row cap is discarded, not
+    // silently truncated to its prefix.
+    var nonEmpty = 0
+    for (var n = 0; n < lines.length; n++) if (lines[n].trim()) nonEmpty++
+    if (nonEmpty > root.maxProviderRows) return
     var providerRows = []
     var takenIds = ({})
-    for (var i = 0; i < lines.length && providerRows.length < root.maxProviderRows; i++) {
+    for (var i = 0; i < lines.length; i++) {
       var line = lines[i].trim()
       if (!line) continue
       var parts = line.split("\t")
@@ -1446,15 +1482,18 @@ Item {
       // the rows it reached, and a row whose `when:` went unanswered shows.
       // Keep the last complete set rather than let a half-read one through.
       // A signal leaves the exit code at 0, so the status is what tells us.
-      if (exitCode !== 0 || exitStatus !== 0) {
+      var lines = guardProc.collected.split("\n")
+      // Non-zero exit (incl. the runner's overflow/deadline codes) or a
+      // result set larger than the cap: fail closed - keep the previous
+      // guard answers rather than accept a truncated decision set.
+      if (exitCode !== 0 || exitStatus !== 0 || lines.length > root.maxGuardLines) {
         if (root.guardsPending) Qt.callLater(function() { root.evaluateGuards() })
         return
       }
 
       var nextWhen = ({})
       var nextChecked = ({})
-      var lines = guardProc.collected.split("\n")
-      for (var i = 0; i < lines.length && i < root.maxGuardLines; i++) {
+      for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim().slice(0, root.maxFieldLen)
         if (!line) continue
         var colon = line.lastIndexOf(":")
