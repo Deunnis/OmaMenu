@@ -4,6 +4,7 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
+import qs.services as OmarchyServices
 import "MenuModel.js" as MenuModel
 
 Item {
@@ -425,7 +426,19 @@ Item {
 
   // Shared application engine (entries, hidden filters, icons, launch,
   // removal), owned by the shell and also used by the standalone launcher.
-  readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
+  // Omarchy 4.0.3 builds a panel-hosted menu's API from the Instantiator's
+  // modelData manifest, where `kinds` is a V4Sequence that Array.isArray()
+  // rejects - so manifestHasKind(..., "menu") fails and appLibrary arrives
+  // null. The next plugin rescan then revokes that API over the profile
+  // mismatch, leaving root.shell itself null. Until that is fixed upstream,
+  // run a private AppLibrary whenever the shell's isn't reachable.
+  readonly property var appLibrary: (root.shell && root.shell.appLibrary)
+    ? root.shell.appLibrary : fallbackAppLibrary.item
+  Loader {
+    id: fallbackAppLibrary
+    active: !(root.shell && root.shell.appLibrary)
+    sourceComponent: OmarchyServices.AppLibrary { }
+  }
   property bool deleteConfirmOpen: false
   property var deleteTarget: null
   onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null }
