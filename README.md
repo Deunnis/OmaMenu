@@ -3,7 +3,8 @@
 The stock [Omarchy](https://omarchy.org/) command menu (`SUPER + SPACE`), with
 one thing added: a **Menu Look** row under Style that resizes this menu, rounds
 its corners, sets its border width and its transparency — live, as you drag —
-**saved per theme**, and without touching the bar, panels, or anything else.
+**kept across theme switches**, and without touching the bar, panels, or
+anything else. A theme that wants a different shape can still keep its own.
 
 ![The menu at 1.12x with 14px corners and 40% transparency](screenshots/menu.jpg)
 
@@ -71,28 +72,34 @@ instantly:
 | Border width | 0–6 px | the theme's menu border width |
 | Transparency | 0–90 % | 0 % (opaque) |
 
-- **Per theme.** Every theme keeps its own four values. Switch themes
-  (`omarchy theme set`, the picker, a rotator like OmaShuffle) and Menu Look
-  switches with it, live — a theme you've never touched just renders with the
-  defaults above.
+- **Applies to — All themes** (the default). One shared look that stays put
+  when the theme changes, however it changes: `omarchy theme set`, the picker,
+  or a rotator like OmaShuffle.
+- **Applies to — Only <theme>** scopes the knobs to the active theme instead,
+  for when a light theme and a dark theme want different shapes. That theme
+  then ignores the shared look; every other theme keeps following it.
+  Switching the scope re-files the current values, it doesn't change them.
 - **Back:** the `‹` at the top of the editor, or `Esc` / `←`.
-- **Reset to theme defaults** clears *this* theme's four values back to
-  "inherit from the shell theme" and leaves every other theme's alone.
+- **Reset** clears whichever entry the scope points at: in *All themes* the
+  four values go back to "inherit from the shell theme"; in *Only <theme>* the
+  override is dropped and the theme rejoins the shared look.
 
 ## Where it keeps things
 
-One file: `~/.local/state/omarchy/io.github.omamenu/style.json`, a small JSON object
-keyed by theme slug:
+One file: `~/.local/state/omarchy/io.github.omamenu/style.json`, a small JSON
+object keyed by theme slug, plus `"*"` for the shared look:
 
 ```json
 {
-  "tokyo-night": { "scale": 1.15, "cornerRadius": 14, "borderWidth": 2, "transparency": 15 },
+  "*":           { "scale": 1.15, "cornerRadius": 14, "borderWidth": 2, "transparency": 15 },
   "rose-pine":   { "scale": 1.0,  "cornerRadius": -1, "borderWidth": -1, "transparency": 0 }
 }
 ```
 
-`-1` means "inherit from the theme". Delete the file for a clean slate; nothing
-else is stored anywhere.
+A theme's own entry wins where it exists, `"*"` applies everywhere else, and
+`-1` means "inherit from the theme". `"*"` can't collide with a real theme —
+slugs are validated against `/^[a-z0-9][a-z0-9._-]*$/` before being used as a
+key. Delete the file for a clean slate; nothing else is stored anywhere.
 
 ## What's changed vs. the built-in menu
 
@@ -157,7 +164,7 @@ omarchy restart shell
 ```
 
 The built-in menu takes over again automatically. Delete
-`~/.local/state/omarchy/io.github.omamenu/` to clear the saved per-theme looks.
+`~/.local/state/omarchy/io.github.omamenu/` to clear the saved looks.
 
 ## Development
 

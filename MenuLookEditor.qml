@@ -5,7 +5,8 @@ import qs.Ui
 // Live style editor for this menu, shown in place of the row list when the
 // "Menu Look" row under Style is chosen. Every slider writes straight to the
 // menu's cfg* properties (instant preview) and debounces a save of the small
-// JSON file behind them.
+// JSON file behind them - into the shared look, or into this theme's own
+// override, depending on the scope row below the blurb.
 Item {
   id: root
 
@@ -21,6 +22,13 @@ Item {
 
   readonly property color fg: root.menu ? root.menu.foreground : Color.foreground
   readonly property string fam: root.menu ? root.menu.fontFamily : Style.font.family
+  // Bounded label for the scope row: a theme slug is only capped at 128
+  // chars upstream, which would push the row past the card's width.
+  readonly property string themeLabel: {
+    var s = root.menu ? String(root.menu.currentThemeSlug || "") : ""
+    if (!s) return "this theme"
+    return s.length > 18 ? s.slice(0, 17) + "…" : s
+  }
 
   Timer {
     id: saveTimer
@@ -28,6 +36,15 @@ Item {
     onTriggered: if (root.menu) root.menu.saveLookConfig()
   }
   function commit() { saveTimer.restart() }
+
+  component ScopeChoice: Text {
+    property bool isCurrent: false
+    color: root.fg
+    font.family: root.fam
+    font.pixelSize: Style.font.body
+    opacity: isCurrent ? 1 : (scopeHover.hovered ? 0.85 : 0.45)
+    HoverHandler { id: scopeHover }
+  }
 
   component Knob: Column {
     id: knob
@@ -110,12 +127,42 @@ Item {
     Text {
       width: parent.width
       wrapMode: Text.WordWrap
-      text: "Applies to this menu only, live as you drag, saved per theme — "
-        + "switching themes switches these too. Esc or ← also goes back."
+      text: "Applies to this menu only, live as you drag, and kept when the "
+        + "theme changes — unless you scope it to this theme alone. "
+        + "Esc or ← also goes back."
       color: root.fg
       opacity: 0.55
       font.family: root.fam
       font.pixelSize: Style.font.bodySmall
+    }
+
+    Column {
+      width: parent.width
+      spacing: Style.space(5)
+
+      Text {
+        text: "Applies to"
+        color: root.fg
+        font.family: root.fam
+        font.pixelSize: Style.font.body
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(14)
+
+        ScopeChoice {
+          text: "All themes"
+          isCurrent: root.menu ? root.menu.lookScopeGlobal : true
+          TapHandler { onTapped: if (root.menu) root.menu.setLookScopeGlobal(true) }
+        }
+
+        ScopeChoice {
+          text: "Only " + root.themeLabel
+          isCurrent: root.menu ? !root.menu.lookScopeGlobal : false
+          TapHandler { onTapped: if (root.menu) root.menu.setLookScopeGlobal(false) }
+        }
+      }
     }
 
     Knob {
@@ -154,7 +201,9 @@ Item {
     Item { width: 1; height: Style.space(2) }
 
     Text {
-      text: "Reset to theme defaults"
+      text: (root.menu && !root.menu.lookScopeGlobal)
+        ? "Reset this theme back to the shared look"
+        : "Reset to theme defaults"
       color: root.fg
       opacity: resetHover.hovered ? 1 : 0.6
       font.family: root.fam

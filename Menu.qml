@@ -47,10 +47,12 @@ Item {
   property string fontFamily: Style.font.menuFamily
 
   // ------------------------------------------------------------------ look
-  // This fork adds a live "Menu Look" editor (a row under Style). Each theme
-  // remembers its own knobs, keyed by theme slug, in one small JSON file
-  // only this menu reads. Every knob has an inherit sentinel so a theme with
-  // no saved profile of its own renders exactly like the stock menu.
+  // This fork adds a live "Menu Look" editor (a row under Style). The knobs
+  // live in one small JSON file only this menu reads. By default they are a
+  // single shared look that survives every theme switch; a theme can opt out
+  // and keep its own override, stored under its slug in the same file. Every
+  // knob has an inherit sentinel, so with nothing saved at either level the
+  // menu renders exactly like the stock one.
   readonly property string lookConfigChain: ".local/state/omarchy/io.github.omamenu"
   readonly property string lookConfigLeaf: "style.json"
   readonly property string lookConfigDir: Quickshell.env("HOME") + "/" + lookConfigChain
@@ -60,6 +62,15 @@ Item {
 
   property string currentThemeSlug: "default"
   property var lookProfiles: ({})    // theme slug -> {scale, cornerRadius, borderWidth, transparency}
+
+  // Key the shared look is stored under, alongside the per-theme overrides.
+  // "*" can never collide with a theme slug - those are validated against
+  // /^[a-z0-9][a-z0-9._-]*$/ before being used as a key - so the two kinds
+  // of entry share one flat map without a nesting change to the file.
+  readonly property string globalLookKey: "*"
+  // Which entry the editor writes to. True (the default) is the shared look;
+  // it only flips while the current theme carries an override of its own.
+  property bool lookScopeGlobal: true
 
   property real cfgScale: 1.0        // card render scale
   property int cfgCornerRadius: -1   // -1 -> Style.cornerRadius
@@ -93,36 +104,68 @@ Item {
     root.applyProfileForCurrentTheme()
   }
 
-  // Pulls this theme's saved knobs (or the inherit defaults, for a theme
-  // with none saved) into the live cfg* properties. Called on load and
-  // whenever the active theme changes.
+  // One stored entry, or null when there is none - or when the file holds
+  // something that isn't an object under that key.
+  function lookEntry(key) {
+    var p = root.lookProfiles ? root.lookProfiles[key] : null
+    return (p && typeof p === "object" && !Array.isArray(p)) ? p : null
+  }
+
+  // Pulls the knobs that apply right now into the live cfg* properties:
+  // this theme's override if it has one, otherwise the shared look,
+  // otherwise the inherit defaults. Also re-points the editor's scope at
+  // whichever of the two the current theme is actually using. Called on
+  // load and whenever the active theme changes.
   function applyProfileForCurrentTheme() {
-    var p = root.clampProfile(root.lookProfiles[root.currentThemeSlug])
+    var own = root.lookEntry(root.currentThemeSlug)
+    var p = root.clampProfile(own || root.lookEntry(root.globalLookKey))
+    root.lookScopeGlobal = !own
     root.cfgScale = p.scale
     root.cfgCornerRadius = p.cornerRadius
     root.cfgBorderWidth = p.borderWidth
     root.cfgTransparency = p.transparency
   }
 
+  // Writes the live knobs into whichever entry the scope points at. Saving
+  // the shared look also drops this theme's override: leaving it in place
+  // would shadow what was just written, so the edit would appear to vanish
+  // on the next load.
   function saveLookConfig() {
     var next = {}
     for (var k in root.lookProfiles) next[k] = root.lookProfiles[k]
-    next[root.currentThemeSlug] = {
+    var entry = {
       scale: Number(root.cfgScale.toFixed(2)),
       cornerRadius: root.cfgCornerRadius,
       borderWidth: root.cfgBorderWidth,
       transparency: root.cfgTransparency
     }
+    if (root.lookScopeGlobal) {
+      next[root.globalLookKey] = entry
+      delete next[root.currentThemeSlug]
+    } else {
+      next[root.currentThemeSlug] = entry
+    }
     root.lookProfiles = next
     root.writeLookConfig(JSON.stringify(next, null, 2) + "\n")
   }
 
-  // Drops this theme's saved knobs entirely rather than writing back today's
-  // theme-derived numbers, so it keeps tracking the theme (not just today's
-  // instance of it) after a reset.
+  // Editor scope switch. The live knobs never move - only where they land.
+  function setLookScopeGlobal(g) {
+    if (root.lookScopeGlobal === g) return
+    root.lookScopeGlobal = g
+    root.saveLookConfig()
+  }
+
+  // Drops the entry the scope points at entirely rather than writing back
+  // today's theme-derived numbers, so whatever is left keeps tracking the
+  // theme (not just today's instance of it) after a reset. Clearing an
+  // override rejoins the shared look; clearing the shared look falls back to
+  // the stock defaults. applyProfileForCurrentTheme() then re-points the
+  // scope at whichever entry survived.
   function resetLookConfig() {
+    var drop = root.lookScopeGlobal ? root.globalLookKey : root.currentThemeSlug
     var next = {}
-    for (var k in root.lookProfiles) if (k !== root.currentThemeSlug) next[k] = root.lookProfiles[k]
+    for (var k in root.lookProfiles) if (k !== drop) next[k] = root.lookProfiles[k]
     root.lookProfiles = next
     root.applyProfileForCurrentTheme()
     root.writeLookConfig(JSON.stringify(next, null, 2) + "\n")
@@ -381,8 +424,9 @@ Item {
 
   // A FileView used only as a change notifier (no read through it) so
   // switching themes - this plugin's picker, `omarchy theme set`, a rotator
-  // like OmaShuffle - re-applies that theme's Menu Look live. The content is
-  // pulled by the bounded reader above.
+  // like OmaShuffle - re-resolves Menu Look live, which changes anything only
+  // when a theme on either side of the switch carries its own override. The
+  // content is pulled by the bounded reader above.
   FileView {
     id: themeNameWatcher
     path: root.currentThemeNamePath

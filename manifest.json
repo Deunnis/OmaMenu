@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Deunnis",
   "license": "MIT",
-  "description": "The stock Omarchy command menu, plus a live \"Menu Look\" row under Style: scale this menu, round its corners, set its border width and transparency - saved per theme, without touching the rest of the shell.",
+  "description": "The stock Omarchy command menu, plus a live \"Menu Look\" row under Style: scale this menu, round its corners, set its border width and transparency - kept across theme switches, or scoped to one theme, without touching the rest of the shell.",
   "kinds": [
     "menu",
     "bar-widget"
