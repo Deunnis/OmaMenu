@@ -199,52 +199,145 @@ Item {
   readonly property int maxMenuItems: 6000
   readonly property int maxGuardLines: 8000
   readonly property int maxFieldLen: 4096
+  // Aggregate bounds. The per-item and per-field caps above still permit a
+  // very large *total*, and for a script handed to a child process the total
+  // is the bound that matters: argv is capped by ARG_MAX long before any
+  // runner deadline or output limit can apply. Both are checked before a
+  // process is spawned, and both fail closed.
+  readonly property int maxGuardCount: 2000
+  readonly property int maxScriptBytes: 262144
+  // The native apps provider snapshots DesktopEntries straight into the
+  // long-lived model, so it needs the same shape of bounds the JSONC path has.
+  readonly property int maxAppRows: 4000
+  readonly property int maxAppAliases: 64
+  readonly property int maxAppBytes: 1048576
+
+  // Byte length of `s` once Qt encodes it as UTF-8 on the way to a child's
+  // stdin. The framed protocol below sends a byte count and QML strings are
+  // UTF-16, so the two have to agree exactly. A lone surrogate counts as the
+  // 3-byte replacement character, which is what that conversion emits.
+  function utf8ByteLen(s) {
+    var n = 0
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i)
+      if (c < 0x80) { n += 1; continue }
+      if (c < 0x800) { n += 2; continue }
+      if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+        var d = s.charCodeAt(i + 1)
+        if (d >= 0xDC00 && d <= 0xDFFF) { n += 4; i += 1; continue }
+      }
+      n += 3
+    }
+    return n
+  }
+
+  // One framed stdin payload: a decimal UTF-8 byte count, a newline, then
+  // exactly that many bytes. Framing means the reader never depends on EOF -
+  // QML has no way to close a child's stdin - and never reads past its limit.
+  function framedPayload(text) {
+    var s = String(text || "")
+    return String(root.utf8ByteLen(s)) + "\n" + s
+  }
+
+  // Refuses an oversized script before any process is spawned.
+  function scriptTooBig(script) {
+    return root.utf8ByteLen(String(script || "")) > root.maxScriptBytes
+  }
   function deadlined(argv) {
     return ["timeout", "-k", "2", String(root.procDeadlineSecs)].concat(argv)
   }
 
-  // Run a `bash -lc` helper with a hard producer-side byte ceiling: the
-  // script's stdout is piped through `head -c`, which closes the pipe (and
-  // SIGPIPEs the producer) at the limit - so an unterminated multi-megabyte
-  // line can't accumulate anywhere before it reaches us. `timeout` still
-  // bounds wall time.
-  // Runs a `bash -lc` helper in its own process group, reads at most
-  // limit+1 bytes of stdout, and on overflow SIGKILLs the whole group and
-  // exits 3 (the caller then discards the stream rather than accepting a
-  // silently-truncated one). Exit 4 propagates a non-zero producer status.
-  // exit 0 ok / 3 byte overflow / 4 producer failed or unreaped / 5 deadline.
-  // The deadline is enforced here, not by an outer `timeout`: the producer
-  // runs in its own session and stdout is drained non-blocking under a
-  // select() budget, and the finally always TERM->KILLs and reaps the whole
-  // session - on EOF, overflow, the internal deadline, or a SIGTERM from
-  // QML destroying the Process (a handler turns that into the same path).
+  // Runs a `bash` helper under a hard byte ceiling and a hard deadline, and
+  // returns its stdout.
+  //
+  // The script itself is NOT in argv. It arrives framed on this runner's
+  // stdin (a decimal byte count, a newline, then exactly that many bytes) and
+  // is handed to `bash -l -s` over a pipe, so it appears in no process's
+  // argv: not this runner's, not the producer's. That keeps a `when:`/
+  // `checked:` guard batch or a provider script - which can legitimately be
+  // large, and can carry private text - out of world-readable
+  // /proc/<pid>/cmdline, and off the ARG_MAX budget that would otherwise
+  // reject the exec outright before any of the limits below could apply.
+  //
+  // exit 0 ok / 3 byte overflow or oversized frame / 4 producer failed,
+  // unreaped, or a malformed frame / 5 deadline.
+  //
+  // The deadline is enforced here, not by the outer `timeout`: the producer
+  // runs in its own session, and its stdin and stdout are driven together in
+  // one non-blocking select() loop under the budget, so a producer that never
+  // drains the script cannot deadlock against a producer that never speaks.
+  // The finally always TERM->KILLs and reaps the whole session - on EOF,
+  // overflow, the internal deadline, or a SIGTERM from QML destroying the
+  // Process (a handler turns that into the same path).
   readonly property string cappedRunnerScript: [
     "import os,sys,signal,subprocess,select,time",
-    "limit=int(sys.argv[1]); script=sys.argv[2]; budget=float(sys.argv[3])",
+    "limit=int(sys.argv[1]); budget=float(sys.argv[2])",
+    "def rd(fd,n):",
+    "    b=bytearray()",
+    "    while len(b)<n:",
+    "        try: c=os.read(fd,n-len(b))",
+    "        except InterruptedError: continue",
+    "        except OSError: return None",
+    "        if not c: return None",
+    "        b+=c",
+    "    return bytes(b)",
+    "# framed stdin: decimal byte count, newline, exactly that many bytes",
+    "hdr=bytearray()",
+    "while True:",
+    "    c=rd(0,1)",
+    "    if c is None: sys.exit(4)",
+    "    if c==b'\\n': break",
+    "    hdr+=c",
+    "    if len(hdr)>24: sys.exit(4)",
+    "try: need=int(hdr.decode('ascii'))",
+    "except Exception: sys.exit(4)",
+    "if need<0 or need>limit: sys.exit(3)",
+    "script=rd(0,need) if need else b''",
+    "if script is None: sys.exit(4)",
     "class Stop(Exception): pass",
     "def _sig(*a): raise Stop()",
     "signal.signal(signal.SIGTERM,_sig); signal.signal(signal.SIGINT,_sig)",
-    "p=subprocess.Popen(['bash','-lc',script], stdout=subprocess.PIPE,",
-    "                   stderr=subprocess.DEVNULL, start_new_session=True)",
+    "p=subprocess.Popen(['bash','-l','-s'], stdin=subprocess.PIPE,",
+    "                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,",
+    "                   start_new_session=True)",
+    "sin=p.stdin.fileno(); sout=p.stdout.fileno()",
     "out=bytearray(); overflow=False; expired=False",
+    "mv=memoryview(script)",
     "end=time.monotonic()+budget",
+    "def shut():",
+    "    global mv",
+    "    mv=None",
+    "    try: p.stdin.close()",
+    "    except Exception: pass",
     "try:",
-    "    os.set_blocking(p.stdout.fileno(), False)",
+    "    os.set_blocking(sout,False); os.set_blocking(sin,False)",
+    "    if not mv: shut()",
     "    while True:",
     "        left=end-time.monotonic()",
     "        if left<=0: expired=True; break",
-    "        r,_,_=select.select([p.stdout],[],[],min(left,0.25))",
+    "        ws=[sin] if mv is not None else []",
+    "        r,w,_=select.select([sout],ws,[],min(left,0.25))",
+    "        if w:",
+    "            try: n=os.write(sin,mv)",
+    "            except (BlockingIOError,InterruptedError): n=0",
+    "            except OSError: n=-1",
+    "            if n<0: shut()",
+    "            else:",
+    "                mv=mv[n:]",
+    "                if not mv: shut()",
     "        if r:",
-    "            try: chunk=p.stdout.read(65536)",
+    "            try: chunk=os.read(sout,65536)",
     "            except (BlockingIOError,InterruptedError): chunk=None",
+    "            except OSError: chunk=b''",
     "            if chunk==b'': break",
     "            if chunk:",
     "                out+=chunk",
     "                if len(out)>limit: overflow=True; break",
-    "        elif p.poll() is not None: break",
+    "        elif not w and mv is None and p.poll() is not None: break",
     "except Stop:",
     "    expired=True",
     "finally:",
+    "    shut()",
     "    for s in (signal.SIGTERM, signal.SIGKILL):",
     "        try: os.killpg(p.pid, s)",
     "        except OSError: break",
@@ -261,11 +354,14 @@ Item {
     "sys.stdout.buffer.write(bytes(out))",
     "sys.exit(0)"
   ].join("\n")
-  function bashCapped(script) {
-    // internal budget is the real deadline; the outer `timeout` is a last
-    // resort a couple of seconds later.
+
+  // argv carries only the limits; the caller sets `pendingScript` on its
+  // Process and writes root.framedPayload(...) to stdin in onStarted. The
+  // internal budget is the real deadline; the outer `timeout` is a last
+  // resort a couple of seconds later.
+  function bashCappedCommand() {
     return root.deadlined(["python3", "-c", root.cappedRunnerScript,
-                           String(root.maxProcOutputBytes), script,
+                           String(root.maxProcOutputBytes),
                            String(root.procDeadlineSecs - 2)])
   }
 
@@ -527,25 +623,69 @@ Item {
   // that: rejects a non-absolute path or one with a `..` segment, opens each
   // with O_WRONLY|O_NOFOLLOW (a planted symlink at the path fails), caps the
   // selection payload, fsyncs, and always touches doneFile last so a waiting
-  // caller is released. argv: selectionFile, doneFile, hasSelection, value.
+  // caller is released. argv carries only selectionFile, doneFile and
+  // hasSelection; the value itself arrives framed on stdin.
   readonly property int maxSelectionBytes: 65536
   // select/input result-file writer. The two paths come from the IPC payload;
   // the stock `omarchy-menu-select` / `-input` callers mktemp them under
   // $TMPDIR, so a result slot must resolve into $XDG_RUNTIME_DIR / $TMPDIR /
-  // /tmp / /var/tmp (blocks e.g. ~/.bashrc), its parent must be a real
-  // directory (O_NOFOLLOW) owned by us, and any pre-existing slot must be a
-  // private (0600) regular file we own - which is exactly what mktemp leaves
-  // and not an arbitrary user file. The write itself is an O_EXCL adjacent
-  // temp + renameat, all relative to the held parent fd; doneFile is only
-  // ever created/left as an empty 0600 file so a waiting caller is released.
+  // /tmp / /var/tmp (blocks e.g. ~/.bashrc), and any pre-existing slot must
+  // be a private (0600) regular file we own - which is exactly what mktemp
+  // leaves and not an arbitrary user file. The write itself is an O_EXCL
+  // adjacent temp + renameat, all relative to the held parent fd; doneFile is
+  // only ever created/left as an empty 0600 file so a waiting caller is
+  // released.
+  //
+  // Two different directory rules, because "sticky and world-writable" is a
+  // property of a temp root and of nothing below it. The matched root may be
+  // the /tmp shape (sticky + world-writable) or ours-and-private; every
+  // component walked *below* it must be ours with no group/other write bit,
+  // so a user-owned but group-writable subdirectory can no longer let another
+  // local user swap request slots mid-protocol. The selected value never
+  // touches argv: it is framed on stdin exactly like the capped runner's
+  // script, so private dmenu input stays out of /proc/<pid>/cmdline.
   readonly property string resultWriterScript: [
     "import os,sys,stat",
-    "sel,done,has,val=sys.argv[1],sys.argv[2],sys.argv[3]=='1',sys.argv[4]",
+    "sel,done,has=sys.argv[1],sys.argv[2],sys.argv[3]=='1'",
+    "LIMIT=65536",
+    "def rd(fd,n):",
+    "    b=bytearray()",
+    "    while len(b)<n:",
+    "        try: c=os.read(fd,n-len(b))",
+    "        except InterruptedError: continue",
+    "        except OSError: return None",
+    "        if not c: return None",
+    "        b+=c",
+    "    return bytes(b)",
+    "val=b''",
+    "def read_value():",
+    "    # framed stdin: decimal byte count, newline, exactly that many bytes.",
+    "    # Returns None if the frame is malformed or over LIMIT; the caller then",
+    "    # degrades to 'no selection' rather than exiting, because an exit here",
+    "    # would skip the doneFile write below and hang the waiting helper.",
+    "    hdr=bytearray()",
+    "    while True:",
+    "        c=rd(0,1)",
+    "        if c is None: return None",
+    "        if c==b'\\n': break",
+    "        hdr+=c",
+    "        if len(hdr)>24: return None",
+    "    try: need=int(hdr.decode('ascii'))",
+    "    except Exception: return None",
+    "    if need<0 or need>LIMIT: return None",
+    "    return (rd(0,need) if need else b'')",
+    "if has:",
+    "    val=read_value()",
+    "    if val is None: has=False",
     "uid=os.getuid()",
     "roots=[os.path.realpath(r) for r in (os.environ.get('XDG_RUNTIME_DIR'),os.environ.get('TMPDIR'),'/tmp','/var/tmp') if r]",
-    "def dir_ok(st):",
-    "    # our own dir, or a sticky world-writable temp dir (/tmp-style)",
-    "    return stat.S_ISDIR(st.st_mode) and (st.st_uid==uid or ((st.st_mode & stat.S_ISVTX) and (st.st_mode & 0o002)))",
+    "def priv_ok(st):",
+    "    # ours, and not writable by group or other",
+    "    return stat.S_ISDIR(st.st_mode) and st.st_uid==uid and not (st.st_mode & 0o022)",
+    "def root_ok(st):",
+    "    # a temp ROOT may also be the sticky world-writable /tmp shape; that",
+    "    # rule is deliberately confined to the root and never inherited",
+    "    return priv_ok(st) or (stat.S_ISDIR(st.st_mode) and (st.st_mode & stat.S_ISVTX) and (st.st_mode & 0o002))",
     "def open_parent(d):",
     "    # d must start at one of the temp roots; walk the remainder",
     "    # component-by-component with held FDs, O_NOFOLLOW past the root.",
@@ -557,11 +697,12 @@ Item {
     "    if root is None: return None",
     "    try: fd=os.open(root, os.O_RDONLY|os.O_DIRECTORY)",
     "    except OSError: return None",
+    "    if not root_ok(os.fstat(fd)): os.close(fd); return None",
     "    for c in comps[ri:]:",
     "        try: nfd=os.open(c, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=fd)",
     "        except OSError: os.close(fd); return None",
     "        os.close(fd); fd=nfd",
-    "        if not dir_ok(os.fstat(fd)): os.close(fd); return None",
+    "        if not priv_ok(os.fstat(fd)): os.close(fd); return None",
     "    return fd",
     "def slot(p, data):",
     "    if not (p.startswith('/') and '..' not in p.split('/') and '\\0' not in p): return",
@@ -570,7 +711,8 @@ Item {
     "    dfd=open_parent(d)",
     "    if dfd is None: return",
     "    try:",
-    "        if not dir_ok(os.fstat(dfd)): return",
+    "        # no re-check here: open_parent validated this exact fd and the",
+    "        # path is never re-walked, so there is no window to re-validate",
     "        try:",
     "            ex=os.stat(name, dir_fd=dfd, follow_symlinks=False)",
     "            if not stat.S_ISREG(ex.st_mode) or ex.st_uid!=uid or (ex.st_mode & 0o077): return",
@@ -597,7 +739,7 @@ Item {
     "            except OSError: pass",
     "    finally:",
     "        os.close(dfd)",
-    "if has: slot(sel, (val + '\\n').encode())",
+    "if has: slot(sel, val + b'\\n')",
     "slot(done, None)"
   ].join("\n")
 
@@ -614,10 +756,13 @@ Item {
     root.selectionFile = ""
     root.doneFile = ""
 
+    resultProc.pendingValue = hasSelection
+      ? String(selection).slice(0, root.maxSelectionBytes)
+      : ""
+    resultProc.hasSelection = hasSelection
     resultProc.command = root.deadlined(["python3", "-c", root.resultWriterScript,
       activeSelectionFile, activeDoneFile,
-      hasSelection ? "1" : "0",
-      hasSelection ? String(selection).slice(0, root.maxSelectionBytes) : ""])
+      hasSelection ? "1" : "0"])
     resultProc.running = true
   }
 
@@ -803,28 +948,56 @@ Item {
   // The apps provider is QML-native: rows come from the shared AppLibrary
   // (DesktopEntries) instead of a bash enumeration, so they carry image
   // icons, launch feedback, and uninstall support like the launcher.
+  //
+  // Being native does not make it unbounded. Entries are parsed from .desktop
+  // files anywhere on XDG_DATA_DIRS and land in a model that outlives the
+  // menu, so this path gets the same explicit entry / field / alias-count /
+  // alias-length / aggregate limits the JSONC and provider paths have - and
+  // fails closed on any of them, discarding the whole snapshot rather than
+  // merging a prefix and presenting it as the complete app list.
   function mergeAppRows() {
     if (!root.appLibrary) return
 
     var rows = root.appLibrary.sortedEntries("")
+    if (rows.length > root.maxAppRows) return
+
     var appRows = []
+    var totalBytes = 0
     for (var j = 0; j < rows.length; j++) {
       var entry = rows[j].entry
       var appId = String(entry.id || "")
       if (!appId) continue
-      var subtext = root.appLibrary.entrySubtext(entry)
+      if (appId.length > root.maxFieldLen) return
+
+      var subtext = String(root.appLibrary.entrySubtext(entry) || "")
+      var appIcon = String(entry.icon || "")
+      var label = String(root.appLibrary.entryName(entry) || "")
+      if (subtext.length > root.maxFieldLen) return
+      if (appIcon.length > root.maxFieldLen) return
+      if (label.length > root.maxFieldLen) return
+
       var aliases = subtext ? [subtext] : []
       try {
         if (entry.keywords && typeof entry.keywords.join === "function") aliases = aliases.concat(entry.keywords)
       } catch (e) { }
+      if (aliases.length > root.maxAppAliases) return
+
+      totalBytes += appId.length + subtext.length + appIcon.length + label.length
+      for (var a = 0; a < aliases.length; a++) {
+        aliases[a] = String(aliases[a] || "")
+        if (aliases[a].length > root.maxFieldLen) return
+        totalBytes += aliases[a].length
+      }
+      if (totalBytes > root.maxAppBytes) return
+
       appRows.push({
         id: "apps." + appId,
         parent: "apps",
         kind: "app",
         icon: "",
-        appIcon: String(entry.icon || ""),
+        appIcon: appIcon,
         appId: appId,
-        label: root.appLibrary.entryName(entry),
+        label: label,
         title: "",
         target: "",
         description: subtext,
@@ -843,24 +1016,30 @@ Item {
     if (root.opened) root.rebuildDisplay()
   }
 
+  // Returns true only when providerProc was actually started, so the queue
+  // in startNextProvider() moves on instead of stalling behind a provider
+  // that ran natively or was refused.
   function startProviderForMenu(id) {
     var entry = root.item(id)
-    if (!entry || !entry.provider || root.providersLoaded[id]) return
+    if (!entry || !entry.provider || root.providersLoaded[id]) return false
     if (entry.provider === "apps") {
       root.providersLoaded[id] = true
       root.mergeAppRows()
-      return
+      return false
     }
     var spec = root.providers[entry.provider]
-    if (!spec) return
+    if (!spec) return false
 
     root.providersLoaded[id] = true
+    if (root.scriptTooBig(spec.script)) return false
     providerProc.menuId = id
     providerProc.providerKey = entry.provider
     providerProc.revision = root.providerRevision
     providerProc.collected = ""
-    providerProc.command = root.bashCapped(spec.script)
+    providerProc.pendingScript = spec.script
+    providerProc.command = root.bashCappedCommand()
     providerProc.running = true
+    return true
   }
 
   function mergeProviderRows(rows, menuId, providerKey) {
@@ -921,8 +1100,7 @@ Item {
       var entry = root.item(id)
       if (!entry || !entry.provider || root.providersLoaded[id]) continue
 
-      root.startProviderForMenu(id)
-      return
+      if (root.startProviderForMenu(id)) return
     }
   }
 
@@ -1411,7 +1589,14 @@ Item {
     property string menuId: ""
     property string providerKey: ""
     property string collected: ""
+    property string pendingScript: ""
     property int revision: 0
+    // The script goes over stdin, never argv (see cappedRunnerScript).
+    stdinEnabled: true
+    onStarted: {
+      write(root.framedPayload(providerProc.pendingScript))
+      providerProc.pendingScript = ""
+    }
     stdout: SplitParser {
       onRead: function(data) {
         if (providerProc.collected.length < root.maxProcOutputBytes)
@@ -1431,6 +1616,15 @@ Item {
 
   Process {
     id: resultProc
+    property string pendingValue: ""
+    property bool hasSelection: false
+    // The selected/typed value goes over stdin, never argv: dmenu input is
+    // user text and /proc/<pid>/cmdline is world-readable.
+    stdinEnabled: true
+    onStarted: {
+      if (resultProc.hasSelection) write(root.framedPayload(resultProc.pendingValue))
+      resultProc.pendingValue = ""
+    }
     onExited: {
       if (root.applySerial === root.requestSerial)
         root.opened = false
@@ -1514,20 +1708,42 @@ Item {
     }
     root.guardsPending = false
 
+    // Aggregate bounds before anything is spawned: the per-field caps still
+    // allow 6000 items x 4 KiB of `when:`/`checked:`, which is a multi-megabyte
+    // batch. Fail closed on either bound - the same thing `!script` does, and
+    // the same thing the exit-code handlers do for a truncated stream - rather
+    // than run a partial set of guards and treat it as a complete answer.
+    var guardCount = 0
+    var guardIds = Object.keys(root.items || {})
+    for (var gi = 0; gi < guardIds.length; gi++) {
+      var guarded = root.items[guardIds[gi]]
+      if (!guarded) continue
+      if (guarded.when) guardCount += 1
+      if (guarded.checked) guardCount += 1
+    }
+
     var script = MenuModel.guardScript(root.items)
-    if (!script) {
+    if (!script || guardCount > root.maxGuardCount || root.scriptTooBig(script)) {
       root.whenResults = ({})
       root.checkedResults = ({})
       return
     }
     guardProc.collected = ""
-    guardProc.command = root.bashCapped(script)
+    guardProc.pendingScript = script
+    guardProc.command = root.bashCappedCommand()
     guardProc.running = true
   }
 
   Process {
     id: guardProc
     property string collected: ""
+    property string pendingScript: ""
+    // The guard batch goes over stdin, never argv (see cappedRunnerScript).
+    stdinEnabled: true
+    onStarted: {
+      write(root.framedPayload(guardProc.pendingScript))
+      guardProc.pendingScript = ""
+    }
     stdout: SplitParser {
       onRead: function(data) {
         if (guardProc.collected.length < root.maxProcOutputBytes)
